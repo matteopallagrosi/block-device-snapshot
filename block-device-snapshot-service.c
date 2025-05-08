@@ -29,7 +29,7 @@ __SYSCALL_DEFINEx(2, _activate_snapshot, char *, dev_name, char *, passwd){
 asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
 #endif
 //TODO: implement the activate snapshot syscall
-printk("%s: activate_snapshot with dev_name \"%s\" and password \"%s\"",MODNAME, dev_name, passwd);
+printk("%s: activate_snapshot\n",MODNAME);
 return 0;
 }
 
@@ -40,7 +40,7 @@ __SYSCALL_DEFINEx(2, _deactivate_snapshot, char *, dev_name, char *, passwd){
 asmlinkage long sys_deactivate_snapshot(char * dev_name, char * passwd){
 #endif
 //TODO: implement the deactivate snapshot syscall
-printk("%s: deactivate_snapshot with dev_name \"%s\" and password \"%s\"",MODNAME, dev_name, passwd);
+printk("%s: deactivate_snapshot\n",MODNAME);
 return 0;
 }
 
