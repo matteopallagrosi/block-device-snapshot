@@ -2,6 +2,7 @@
 #include <linux/kernel.h>
 #include <linux/syscalls.h>
 #include <linux/version.h>
+#include "lib/include/scth.h"
 
 #define AUDIT if(1)
 
