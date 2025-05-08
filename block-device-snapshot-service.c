@@ -30,6 +30,7 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
 #endif
 //TODO: implement the activate snapshot syscall
 printk("%s: activate_snapshot with dev_name \"%s\" and password \"%s\"",MODNAME, dev_name, passwd);
+return 0;
 }
 
 
@@ -40,6 +41,7 @@ asmlinkage long sys_deactivate_snapshot(char * dev_name, char * passwd){
 #endif
 //TODO: implement the deactivate snapshot syscall
 printk("%s: deactivate_snapshot with dev_name \"%s\" and password \"%s\"",MODNAME, dev_name, passwd);
+return 0;
 }
 
 
