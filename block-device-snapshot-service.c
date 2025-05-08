@@ -3,6 +3,8 @@
 #include <linux/syscalls.h>
 #include <linux/version.h>
 
+#define AUDIT if(1)
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Matteo Pallagrosi");
 MODULE_DESCRIPTION("block device snapshot service");
