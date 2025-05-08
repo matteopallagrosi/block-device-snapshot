@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <unistd.h>
 
 #define SYSCALL1 174 //Put here the syscall number returned by the kernel when loading the syscall_table_discoverer module
 #define SYSCALL2 177
