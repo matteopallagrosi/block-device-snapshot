@@ -11,3 +11,6 @@ clean:
 
 mount:
 	insmod the_block-device-snapshot-service.ko the_syscall_table=$(A)
+	
+unmount:
+	rmmod the_block-device-snapshot-service
