@@ -2,6 +2,9 @@
 #include <linux/kernel.h>
 #include <linux/syscalls.h>
 #include <linux/version.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/path.h>
 #include "lib/include/scth.h"
 
 #define AUDIT if(1)
@@ -57,6 +60,9 @@ int init_module(void) {
 
     int i;
     int ret;
+    struct path root_path;
+    struct dentry *dentry;
+    int err;
 
     if (the_syscall_table == 0x0){
         printk("%s: cannot manage sys_call_table address set to 0x0\n",MODNAME);
@@ -90,13 +96,40 @@ int init_module(void) {
 
     //Crea la directory /snapshot nel root filesystem
     //Questa directory sarà utilizzata per memorizzare gli snapshot dei block device
-    long ret = sys_mkdir("/snapshot", 0700)
+    err = kern_path("/", LOOKUP_DIRECTORY, &root_path);
+    if (err) {
+        printk("%s: cannot find root directory\n", MODNAME);
+        return err;
+    }
+
+    dentry = lookup_one_len("snapshot", root_path.dentry, strlen("snapshot"));
+    if (IS_ERR(dentry)) {
+        pr_err("Errore nel creare il dentry: %ld\n", PTR_ERR(dentry));
+        return PTR_ERR(dentry);
+    }
+
+    // Creare la directory /snapshot se non esiste
+    if (!dentry->d_inode) {
+        //TODO: vfs_mkdir cambia signature a seconda della versione del kernel (senza primo parametro, oppure primo parametro mnt_idmap)
+        struct user_namespace *user_ns = root_path.mnt->mnt_sb->s_user_ns;
+        err = vfs_mkdir(user_ns, d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
+        if (err)
+            pr_err("Errore nella creazione di /snapshot: %d\n", err);
+        else
+            pr_info("Directory /snapshot creata con successo.\n");
+    } else {
+        pr_info("/snapshot esiste già.\n");
+    }
+
+    dput(dentry);
+
+    /*ret = sys_mkdir("/snapshot", 0700);
     if (likely(ret == 0)) {
         printk("%s: /snapshot directory created successfully\n", MODNAME);
     } else {
         printk("%s: could not create /snapshot directory\n", MODNAME);
         return -1;
-    }
+    }*/
 
     return 0;
 
@@ -117,5 +150,7 @@ void cleanup_module(void) {
     }
     protect_memory();
     printk("%s: sys-call table restored to its original content\n",MODNAME);
+
+    //TODO: rimozione directory snapshot
     
 }
