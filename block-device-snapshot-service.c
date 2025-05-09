@@ -88,9 +88,19 @@ int init_module(void) {
 
     printk("%s: all new system-calls correctly installed on sys-call table\n",MODNAME);
 
+    //Crea la directory /snapshot nel root filesystem
+    //Questa directory sarà utilizzata per memorizzare gli snapshot dei block device
+    long ret = sys_mkdir("/snapshot", 0700)
+    if (likely(ret == 0)) {
+        printk("%s: /snapshot directory created successfully\n", MODNAME);
+    } else {
+        printk("%s: could not create /snapshot directory\n", MODNAME);
+        return -1;
+    }
+
     return 0;
 
-    }
+}
 
 
 
