@@ -94,31 +94,39 @@ int init_module(void) {
 
     printk("%s: all new system-calls correctly installed on sys-call table\n",MODNAME);
 
-    //Crea la directory /snapshot nel root filesystem
+    //Creazione della directory /snapshot nel root filesystem
     //Questa directory sarà utilizzata per memorizzare gli snapshot dei block device
+    //kern_path risolve il percorso specificato. Se il percorso è valido e accessibile, riempie il campo struct path *path con mount point e dentry.
     err = kern_path("/", LOOKUP_DIRECTORY, &root_path);
     if (err) {
-        printk("%s: cannot find root directory\n", MODNAME);
+        printk("%s: cannot retrieve requested root directory\n", MODNAME);
         return err;
     }
 
+    //Verifica se la directory snapshot è gia esistente. Ritorna NULL se non esiste
     dentry = lookup_one_len("snapshot", root_path.dentry, strlen("snapshot"));
     if (IS_ERR(dentry)) {
-        pr_err("Errore nel creare il dentry: %ld\n", PTR_ERR(dentry));
-        return PTR_ERR(dentry);
+        printk("%s: error in lookup dentry\n", MODNAME);
+        return -1;
     }
 
     // Creare la directory /snapshot se non esiste
-    if (!dentry->d_inode) {
-        //TODO: vfs_mkdir cambia signature a seconda della versione del kernel (senza primo parametro, oppure primo parametro mnt_idmap)
+    if (!dentry) {
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(5,12,0)
+        err = vfs_mkdir(d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
+        #elif LINUX_VERSION_CODE < KERNEL_VERSION(6,3,0)
         struct user_namespace *user_ns = root_path.mnt->mnt_sb->s_user_ns;
         err = vfs_mkdir(user_ns, d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
+        #else
+        struct mnt_idmap = mnt_idmap(root_path.mnt);
+        err = vfs_mkdir(idmap, d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
+        #endif
         if (err)
             pr_err("Errore nella creazione di /snapshot: %d\n", err);
         else
             pr_info("Directory /snapshot creata con successo.\n");
     } else {
-        pr_info("/snapshot esiste già.\n");
+        pr_info("%s: /snapshot already exists.\n", MODNAME);
     }
 
     dput(dentry);
