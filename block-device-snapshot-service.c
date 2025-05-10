@@ -103,15 +103,15 @@ int init_module(void) {
         return err;
     }
 
-    //Verifica se la directory snapshot è gia esistente. Ritorna NULL se non esiste
+    //Verifica se la directory snapshot è gia esistente. Se non esiste crea la dentry con quel nome.
     dentry = lookup_one_len("snapshot", root_path.dentry, strlen("snapshot"));
     if (IS_ERR(dentry)) {
         printk("%s: error in lookup dentry\n", MODNAME);
         return -1;
     }
 
-    // Creare la directory /snapshot se non esiste
-    if (!dentry) {
+    // Crea la directory /snapshot se non esiste (crea inode da associare alla dentry).
+    if (!dentry->d_inode) {
         #if LINUX_VERSION_CODE < KERNEL_VERSION(5,12,0)
         err = vfs_mkdir(d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
         #elif LINUX_VERSION_CODE < KERNEL_VERSION(6,3,0)
@@ -122,22 +122,14 @@ int init_module(void) {
         err = vfs_mkdir(idmap, d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
         #endif
         if (err)
-            pr_err("Errore nella creazione di /snapshot: %d\n", err);
+            printk("%s: cannot create /snapshot directory (%s)\n", MODNAME, err);
         else
-            pr_info("Directory /snapshot creata con successo.\n");
+            printk("%s: directory /snapshot succesfully created.\n", MODNAME);
     } else {
-        pr_info("%s: /snapshot already exists.\n", MODNAME);
+        printk("%s: /snapshot already exists.\n", MODNAME);
     }
 
     dput(dentry);
-
-    /*ret = sys_mkdir("/snapshot", 0700);
-    if (likely(ret == 0)) {
-        printk("%s: /snapshot directory created successfully\n", MODNAME);
-    } else {
-        printk("%s: could not create /snapshot directory\n", MODNAME);
-        return -1;
-    }*/
 
     return 0;
 
