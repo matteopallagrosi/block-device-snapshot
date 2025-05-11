@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <linux/namei.h>
 #include <linux/path.h>
+#include <linux/user_namespace.h>
 #include "lib/include/scth.h"
 
 #define AUDIT if(1)
@@ -122,7 +123,7 @@ int init_module(void) {
         err = vfs_mkdir(idmap, d_inode(root_path.dentry), dentry, S_IFDIR | 0755);
         #endif
         if (err)
-            printk("%s: cannot create /snapshot directory (%s)\n", MODNAME, err);
+            printk("%s: cannot create /snapshot directory (%d)\n", MODNAME, err);
         else
             printk("%s: directory /snapshot succesfully created.\n", MODNAME);
     } else {
@@ -140,7 +141,10 @@ int init_module(void) {
 //Rimozione del modulo
 void cleanup_module(void) {
 
-    int i;
+    int i, err;
+    struct path root_path;
+    struct dentry *dentry;
+
             
     printk("%s: shutting down\n",MODNAME);
 
@@ -151,6 +155,38 @@ void cleanup_module(void) {
     protect_memory();
     printk("%s: sys-call table restored to its original content\n",MODNAME);
 
-    //TODO: rimozione directory snapshot
-    
+    //Recupera mount point e dentry della root directory.
+    err = kern_path("/", LOOKUP_DIRECTORY, &root_path);
+    if (err) {
+        printk("%s: cannot retrieve requested root directory\n", MODNAME);
+    }
+
+    //recupera la dentry associata alla directory /snapshot.
+    dentry = lookup_one_len("snapshot", root_path.dentry, strlen("snapshot"));
+    if (IS_ERR(dentry)) {
+        printk("%s: error in lookup dentry\n", MODNAME);
+    }
+
+
+    //Rimuove la directory se esiste.
+    if (dentry->d_inode) {
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(5,12,0)
+        err = vfs_rmdir(d_inode(root_path.dentry), dentry);
+        #elif LINUX_VERSION_CODE < KERNEL_VERSION(6,3,0)
+        struct user_namespace *user_ns = root_path.mnt->mnt_sb->s_user_ns;
+        err = vfs_rmdir(user_ns, d_inode(root_path.dentry), dentry);
+        #else
+        struct mnt_idmap = mnt_idmap(root_path.mnt);
+        err = vfs_rmdir(idmap, d_inode(root_path.dentry), dentry);
+        #endif
+        if (err)
+            printk("%s: cannot remove /snapshot directory (%d)\n", MODNAME, err);
+        else
+            printk("%s: directory /snapshot succesfully removed.\n", MODNAME);
+    } else {
+        printk("%s: /snapshot does not exist.\n", MODNAME);
+    }
+
+    dput(dentry);
+
 }
