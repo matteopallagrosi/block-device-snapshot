@@ -10,7 +10,9 @@ clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
 
 mount:
+	mkdir /snapshot
 	insmod the_block-device-snapshot-service.ko the_syscall_table=$(A)
 	
 unmount:
+	rm -rf /snapshot
 	rmmod the_block-device-snapshot-service
