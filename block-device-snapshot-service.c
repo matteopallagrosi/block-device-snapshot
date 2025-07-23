@@ -156,6 +156,7 @@ asmlinkage long sys_deactivate_snapshot(char * dev_name, char * passwd){
         return -EFAULT;
     }
 
+    //Il thread viene messo non preemptabile
     spin_lock(&queue_lock);
 
     //Recupera il nodo associato a dev_name dalla lista
@@ -187,12 +188,13 @@ asmlinkage long sys_deactivate_snapshot(char * dev_name, char * passwd){
     //Attende che eventuali standing readers abbiano completato la lettura
     //synchronize_rcu();
 
+    //Il thread è messo preemptabile
     spin_unlock(&queue_lock);
 
     //Rimuove il nodo
     kmem_cache_free(cache, removed);
 
-    printk("%s: deactivated snapshot service for device %s\n",MODNAME, dev_name);
+    printk("%s: deactivated snapshot service for device %s\n",MODNAME, buffer);
 
     return 0;
 }
