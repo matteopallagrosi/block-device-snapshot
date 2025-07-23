@@ -8,6 +8,6 @@
 
 extern const u8 stored_passwd_hash[MAX_PASSWD_SIZE];
 
-int check_password(const char __user *passwd);
+int check_password(const char *passwd);
 
 #endif
