@@ -6,8 +6,10 @@
 #include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/user_namespace.h>
+#include <linux/string.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
+#include <linux/rcupdate.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
 
@@ -43,6 +45,7 @@ typedef struct _device{
 
 //lista di device per cui è stato attivato il servizio di snapshot
 device *head = NULL;
+//lock per update della lista di device
 spinlock_t queue_lock;
 
 struct kmem_cache *cache;
@@ -55,7 +58,7 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
 
     device *node;
     char buffer[MAX_DEV_NAME_SIZE];
-    unsigned long ret;
+    int ret;
 
     printk("%s: activate_snapshot\n",MODNAME);
 
@@ -87,6 +90,7 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
     ret = copy_from_user((char*)buffer,(char*)dev_name,size);
     // Se copy_from_user fallisce, ossia non copia completamente il nome del device, allora si libera il nodo allocato e si ritorna errore
     if (ret != 0) {
+        printk("%s: failed to copy device name from user space\n", MODNAME);
         kmem_cache_free(cache, node);
         return -EFAULT;
     }
@@ -100,7 +104,12 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
 
     //inserimento in testa -> l'ultimo device registrato è probabile sia il prossimo ad essere montato, quindi velocizza la scansione dalla lista partendo dalla testa
     node->next = head;
+    //mefence per rendere gli update immediatamente visibili a tutti
+    asm volatile("mfence");
     head = node;
+    asm volatile("mfence");
+    //I lettori che accedono alla struttura dopo questo update vedono la nuova testa.
+	//I lettori che in concorrenza stanno attraversando la lista non hanno problemi con questo inserimento in testa.
 
     spin_unlock(&queue_lock);
 
@@ -116,8 +125,75 @@ __SYSCALL_DEFINEx(2, _deactivate_snapshot, char *, dev_name, char *, passwd){
 asmlinkage long sys_deactivate_snapshot(char * dev_name, char * passwd){
 #endif
 
-    //TODO: implement the deactivate snapshot syscall
+    device *p, *removed = NULL;
+    char buffer[MAX_DEV_NAME_SIZE];
+    int ret;
+
     printk("%s: deactivate_snapshot\n",MODNAME);
+
+    // Controlla che l'euid sia root (0)
+    if (current_euid().val != 0) {
+        printk("%s: permission denied, not root\n", MODNAME);
+        return -EPERM;
+    }
+
+    // Controlla che la password sia corretta
+    ret = check_password(passwd);
+    if (ret != 0) {
+        printk("%s: password check failed\n", MODNAME);
+        return -EINVAL;
+    }
+
+    //Copia il nome del device in un buffer del kernel
+    size_t size = strnlen_user(dev_name, MAX_DEV_NAME_SIZE);
+    if (size == 0 || size > MAX_DEV_NAME_SIZE) {
+        printk("%s: device name size is invalid\n", MODNAME);
+        return -EINVAL;
+    }
+    ret = copy_from_user((char*)buffer, (char*)dev_name, size);
+    if (ret != 0) {
+        printk("%s: failed to copy device name from user space\n", MODNAME);
+        return -EFAULT;
+    }
+
+    spin_lock(&queue_lock);
+
+    //Recupera il nodo associato a dev_name dalla lista
+    p = head;
+
+	if(p != NULL && strcmp(p->dev_name, buffer) == 0){
+        removed = p;
+		head = removed->next;
+		asm volatile("mfence");
+    }
+    else{
+	    while(p != NULL){
+			if ( p->next != NULL && strcmp(p->next->dev_name, buffer) == 0) {
+				removed = p->next;
+				p->next = p->next->next;
+				asm volatile("mfence");
+				break;
+			}	
+			p = p->next;	
+		}
+	}
+
+    if (removed == NULL) {
+        spin_unlock(&queue_lock);
+        printk("%s: device %s not found in snapshot service list\n", MODNAME, dev_name);
+        return -ENOENT;
+    }
+
+    //Attende che eventuali standing readers abbiano completato la lettura
+    //synchronize_rcu();
+
+    spin_unlock(&queue_lock);
+
+    //Rimuove il nodo
+    kmem_cache_free(cache, removed);
+
+    printk("%s: deactivated snapshot service for device %s\n",MODNAME, dev_name);
+
     return 0;
 }
 
@@ -146,7 +222,6 @@ int init_module(void) {
     }
 
     cache = kmem_cache_create ("snapshot-service", sizeof(device), 0, SLAB_POISON, NULL);
-
     if (cache == NULL){
             printk("%s: could not setup the service memcache\n",MODNAME);
             return -ENOMEM;
@@ -193,5 +268,8 @@ void cleanup_module(void) {
     }
     protect_memory();
     printk("%s: sys-call table restored to its original content\n",MODNAME);
+
+    kmem_cache_destroy(cache);
+    printk("%s: memcache destroyed\n",MODNAME);
 
 }

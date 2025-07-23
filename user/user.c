@@ -10,6 +10,6 @@ int main(int argc, char** argv){
     syscall(SYSCALL1, "device_1", "test");
     
     //Test syscall 2
-    syscall(SYSCALL2, "device_2", "test");	
+    syscall(SYSCALL2, "device_1", "test");	
 	return 0;
 }
