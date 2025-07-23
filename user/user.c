@@ -7,9 +7,9 @@
 int main(int argc, char** argv){
        
     //Test syscall 1
-    syscall(SYSCALL1, "device_1", "password_1");
+    syscall(SYSCALL1, "device_1", "test");
     
     //Test syscall 2
-    syscall(SYSCALL2, "device_2", "password_2");	
+    syscall(SYSCALL2, "device_2", "test");	
 	return 0;
 }

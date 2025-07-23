@@ -6,7 +6,10 @@
 #include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/user_namespace.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
 #include "lib/include/scth.h"
+#include "lib/include/auth.h"
 
 #define AUDIT if(1)
 
@@ -27,7 +30,9 @@ unsigned long new_sys_call_array[] = {0x0,0x0};
 int restore[HACKED_ENTRIES] = {[0 ... (HACKED_ENTRIES-1)] -1};
 
 
-#define MAX_DEV_NAME_SIZE 5
+#define MAX_PASSWD_SIZE 32
+
+#define MAX_DEV_NAME_SIZE 120
 
 //dev_name può essere un nome di device oppure il path di un file device
 typedef struct _device{
@@ -42,7 +47,6 @@ spinlock_t queue_lock;
 
 struct kmem_cache *cache;
 
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 __SYSCALL_DEFINEx(2, _activate_snapshot, char *, dev_name, char *, passwd){
 #else
@@ -55,7 +59,18 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
 
     printk("%s: activate_snapshot\n",MODNAME);
 
-    //TODO: check passwd
+    // Controlla che l'euid sia root (0)
+    if (current_euid().val != 0) {
+        printk("%s: permission denied, not root\n", MODNAME);
+        return -EPERM;
+    }
+
+    // Controlla che la password sia corretta
+    ret = check_password(passwd);
+    if (ret != 0) {
+        printk("%s: password check failed\n", MODNAME);
+        return -EINVAL;
+    }
 
     //registra dev_name all'interno della lista dei device con snapshot attivo
     node = kmem_cache_alloc(cache, GFP_USER);
