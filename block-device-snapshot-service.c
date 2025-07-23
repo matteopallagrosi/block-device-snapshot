@@ -99,7 +99,7 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
     //Copia dal buffer intermedio nel chunk allocato con cached allocator
 	memcpy((char*)node->dev_name,buffer,node->name_size);
 
-    //La coda à globale, quindi è necessario gestire la concorrenza negli accessi
+    //La coda à globale, quindi è necessario gestire la concorrenza negli accessi in scrittura
     spin_lock(&queue_lock);
 
     //inserimento in testa -> l'ultimo device registrato è probabile sia il prossimo ad essere montato, quindi velocizza la scansione dalla lista partendo dalla testa
@@ -181,17 +181,17 @@ asmlinkage long sys_deactivate_snapshot(char * dev_name, char * passwd){
 
     if (removed == NULL) {
         spin_unlock(&queue_lock);
-        printk("%s: device %s not found in snapshot service list\n", MODNAME, dev_name);
+        printk("%s: device %s not found in snapshot service list\n", MODNAME, buffer);
         return -ENOENT;
     }
 
-    //Attende che eventuali standing readers abbiano completato la lettura
-    //synchronize_rcu();
-
-    //Il thread è messo preemptabile
+    //Il thread è rimesso preemptabile
     spin_unlock(&queue_lock);
 
-    //Rimuove il nodo
+    //Attende che eventuali standing readers abbiano completato la lettura
+    synchronize_rcu();
+
+    //Rimuove il nodo in modo safe rispetto alla concorrenza
     kmem_cache_free(cache, removed);
 
     printk("%s: deactivated snapshot service for device %s\n",MODNAME, buffer);
@@ -271,6 +271,7 @@ void cleanup_module(void) {
     protect_memory();
     printk("%s: sys-call table restored to its original content\n",MODNAME);
 
+    //TODO: rimuovere  tutti i nodi della lista dei device prima di distruggere la memcache
     kmem_cache_destroy(cache);
     printk("%s: memcache destroyed\n",MODNAME);
 
