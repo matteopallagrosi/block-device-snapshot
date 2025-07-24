@@ -10,6 +10,8 @@
 #include <linux/crypto.h>
 #include <crypto/hash.h>
 #include <linux/rcupdate.h>
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
 
@@ -49,6 +51,13 @@ device *head = NULL;
 spinlock_t queue_lock;
 
 struct kmem_cache *cache;
+
+static struct kprobe kp_mount;
+
+static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
+    printk("%s: mount_pre_hook\n", MODNAME);
+    return 0;
+}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 __SYSCALL_DEFINEx(2, _activate_snapshot, char *, dev_name, char *, passwd){
@@ -229,6 +238,16 @@ int init_module(void) {
             return -ENOMEM;
     }
 
+
+    kp_mount.symbol_name = "mount_bdev";
+    kp_mount.pre_handler = (kprobe_pre_handler_t)mount_pre_hook;
+    ret = register_kprobe(&kp_mount);
+    if (ret < 0) {
+		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
+        kmem_cache_destroy(cache);
+		return ret;
+	}
+
     spin_lock_init(&queue_lock);
 
     new_sys_call_array[0] = (unsigned long)sys_activate_snapshot;
@@ -237,7 +256,9 @@ int init_module(void) {
     ret = get_entries(restore,HACKED_ENTRIES,(unsigned long)the_syscall_table,&the_ni_syscall);
 
     if (ret != HACKED_ENTRIES) {
-        printk("%s: could not hack %d entries (just %d)\n",MODNAME,HACKED_ENTRIES,ret); 
+        printk("%s: could not hack %d entries (just %d)\n",MODNAME,HACKED_ENTRIES,ret);
+        kmem_cache_destroy(cache);
+        unregister_kprobe(&kp_mount);
         return -1;      
     }
 
@@ -275,4 +296,6 @@ void cleanup_module(void) {
     kmem_cache_destroy(cache);
     printk("%s: memcache destroyed\n",MODNAME);
 
+    unregister_kprobe(&kp_mount);
+    printk("%s: mount kprobe unregistered\n",MODNAME);
 }
