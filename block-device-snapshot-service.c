@@ -55,7 +55,79 @@ struct kmem_cache *cache;
 static struct kprobe kp_mount;
 
 static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
-    printk("%s: mount_pre_hook\n", MODNAME);
+
+    struct block_device *bdev;
+    struct loop_device *lo;
+    struct file *backing_file;
+    struct path file_path;
+    char *file_buff, *file_name;
+    
+    char *dev_name = (char *)regs->dx; // dx contiene il terzo argomento della syscall mount, ossia il nome del device
+
+    //Verifica se il device è un file device (ossia se il nome inizia con /dev/loop)
+    //In tal caso deve recuperare il nome del file associato al device
+    if (strncmp(dev_name, "/dev/loop", 9) == 0) {
+
+        //Apre il block device tramite il nome. Può essere bloccante (TODO: gestire preemption sistema probing)
+        bdev = blkdev_get_by_path(dev_name, FMODE_READ, NULL);
+        if (IS_ERR(bdev)) {
+            printk("%s: Failed to open block device with error %ld\n", MODNAME, PTR_ERR(bdev));
+            return -1;
+        }
+
+        //Recupera i private data del block device
+        lo = bdev->bd_disk->private_data;
+
+        //Recupera la sessione verso il file associato al device
+        backing_file = lo->lo_backing_file;
+        if (!backing_file) {
+            printk("%s: No backing file attached to loop device %s\n", MODNAME, dev_name);
+            blkdev_put(bdev, FMODE_READ);
+            return -1;
+        }
+
+        //Recupera il path del file associato al device
+        file_path = backing_file->f_path;
+        path_get(&file_path); //Incrementa il reference counter del path
+
+        //L'allocazione di memoria non può essere bloccante con GFP_ATOMIC
+        file_buff = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (!file_buff) {
+            path_put(&file_path);
+            blkdev_put(bdev, FMODE_READ);
+            return -1;
+        }
+
+        //Rrecupera il path name del file associato al device
+        //Dalla documentazione -> Note: Callers should use the returned pointer, not the passed
+        //in buffer, to use the name! The implementation often starts at an offset
+        //into the buffer, and may leave 0 bytes at the start.
+        file_name = d_path(&file_path, file_buff, PATH_MAX);
+
+        printk("%s: loop device %s is associated with file %s\n", MODNAME, dev_name, file_name);
+        kfree(file_buff);
+        path_put(&file_path);
+        blkdev_put(bdev, FMODE_READ);
+        
+        return 0;
+    }
+    
+    printk("%s: mount called on block device %s\n", MODNAME, dev_name);
+
+    return 0;
+    }
+
+
+    //Controlla se il device è nella lista dei device con snapshot attivo
+    device *p = head;
+    while (p != NULL) {
+        if (strncmp(p->dev_name, dev_name, p->name_size) == 0) {
+            printk("%s: device %s has an active snapshot, preventing mount\n", MODNAME, p->dev_name);
+            //Se il device è nella lista, allora non è possibile montarlo
+            return -EPERM; // Permesso negato
+        }
+        p = p->next;
+    }
     return 0;
 }
 
