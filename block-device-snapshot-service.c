@@ -36,6 +36,16 @@ unsigned long new_sys_call_array[] = {0x0,0x0};
 #define HACKED_ENTRIES (int)(sizeof(new_sys_call_array)/sizeof(unsigned long))
 int restore[HACKED_ENTRIES] = {[0 ... (HACKED_ENTRIES-1)] -1};
 
+#define setup_target_func "run_on_cpu"
+
+DEFINE_PER_CPU(unsigned long, BRUTE_START);
+DEFINE_PER_CPU(unsigned long *, kprobe_context_pointer);
+
+//number of CPUs that succesfully found the address of the per-CPU variable (current_krpobe) that keeps the reference to the current kprobe context
+unsigned long successful_search_counter = 0;
+
+//offset of the per-CPU variable that keeps the reference to the current kprobe context
+unsigned long* reference_offset = 0x0;
 
 #define MAX_PASSWD_SIZE 32
 
@@ -55,10 +65,51 @@ spinlock_t queue_lock;
 
 struct kmem_cache *cache;
 
+static struct kretprobe setup_probe; //probe per gestione variabili per-cpu
+static struct kretprobe *the_retprobe = &setup_probe; 
 static struct kprobe kp_mount;
+
+///Funzione di cui viene richiesta l'esecuzione alle altre cpu con smp_call_fuction() -> IPI
+void run_on_cpu(void* x) {//this is here just to enable a kprobe on it 
+	printk("%s: running on CPU %d\n", MODNAME, smp_processor_id());
+	return;
+}
+
+//Quando installo il modulo, nella init lancia con smp_call_function su ogni cpu la run_on_cpu, che al momento della return provoca l'esecuzione dell'hook the_search
+static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) { 
+
+	unsigned long* temp = (unsigned long)&BRUTE_START;
+
+	printk("%s: running the brute force search on CPU %d\n", MODNAME, smp_processor_id());
+
+	while (temp > 0) {
+        //brute force search of the current_kprobe per-CPU variable
+		//for enabling blocking execution of the kretprobe
+		//you can save this time setting up a per CPU-variable via 
+		//smp_call_function() upon module startup
+        temp -= 1; 
+        #ifndef CONFIG_KRETPROBE_ON_RETHOOK
+        if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) &ri->rp->kp) {
+        #else
+        if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) &the_retprobe->kp) {
+        #endif
+		    atomic_inc((atomic_t*)&successful_search_counter);//mention we have found the target 
+		    printk("%s: found the target per-cpu variable (CPU %d) - offset is %p\n", MODNAME, smp_processor_id(),temp);
+		    reference_offset = temp;//this assignment is done by multiple threads with no problem (perchè la struttura della per-cpu memory è la stessa per tutte le cpu, quindi tutte scrivono lo stesso offset qui)
+            break;
+        }
+	    if(temp <= 0) return 1;
+    }
+
+	//Su ogni cpu viene scritta una nuova variabile per cpu che mantiene per quella cpu il riferimento al contesto di krpobing (ossia l'indirizzo della variabile per-cpu current_kprobe)
+	__this_cpu_write(kprobe_context_pointer, temp);
+
+	return 0;
+}
 
 static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 
+    unsigned long* kprobe_cpu;
     struct block_device *bdev;
     device *p;
     struct loop_device *lo;
@@ -77,6 +128,9 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     //In tal caso deve recuperare il nome del file associato al device
     if (strncmp(dev_name, "/dev/loop", 9) == 0) {
 
+        //Annulla il contesto corrente di probing
+        kprobe_cpu = __this_cpu_read(kprobe_context_pointer);
+        __this_cpu_write(*kprobe_cpu, NULL);
         preempt_enable();
 
         //Apre il block device tramite il nome. Può essere bloccante (TODO: gestire preemption sistema probing)
@@ -108,8 +162,12 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         #endif    
 
         preempt_disable();
-
-        #if LINUX_VERSION_CODE <= KERNEL_VERSION(6,8,0)
+        //Recupera l'indirizzo della variabile per-cpu con il contesto di probing
+ 	    kprobe_cpu = __this_cpu_read(kprobe_context_pointer);
+        //Ripristina il contesto di probing
+        __this_cpu_write(*kprobe_cpu, kp);
+        
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
         //Recupera i private data del block device
         lo = (struct loop_device *)bdev->bd_disk->private_data;
 
@@ -369,6 +427,40 @@ int init_module(void) {
         kmem_cache_destroy(cache);
 		return ret;
 	}
+
+    setup_probe.kp.symbol_name = setup_target_func;
+	setup_probe.handler = NULL;
+	setup_probe.entry_handler = (kretprobe_handler_t)the_search;
+	setup_probe.maxactive = -1;
+    ret = register_kretprobe(&setup_probe);
+	if (ret < 0) {
+		printk("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
+		return ret;
+	}
+
+    smp_call_function(run_on_cpu,NULL,1);
+
+    if(successful_search_counter != (num_online_cpus() - 1)) {
+	    printk("%s: read hook load failed - number of setup CPUs is %ld - number of remote online CPUs is %d\n", MODNAME, successful_search_counter, num_online_cpus() - 1);
+		put_cpu();
+	 	unregister_kretprobe(&setup_probe);
+        unregister_kprobe(&kp_mount);
+        kmem_cache_destroy(cache);
+		return -1;
+	}
+
+    if (reference_offset == 0x0){
+		printk("%s: inconsistent value found for refeence offset\n", MODNAME);
+		put_cpu();
+	 	unregister_kretprobe(&setup_probe);
+        unregister_kprobe(&kp_mount);
+        kmem_cache_destroy(cache);
+		return -1;
+	}
+
+    //La cpu corrente su cui sta eseguendo la init è l'unica non colpita dall'IPI, quindi questo thread setta la varibaile per-cpu prendendo l'offset impostato da una qualunque altra cpu.
+	//Questo perchè l'offset nella per-cpu memory a cui si trova la variabile current_kprobe è sempre lo stesso.
+	__this_cpu_write(kprobe_context_pointer, reference_offset);
 
     spin_lock_init(&queue_lock);
 
