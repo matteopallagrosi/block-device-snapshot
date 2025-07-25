@@ -12,8 +12,11 @@
 #include <linux/rcupdate.h>
 #include <linux/kprobes.h>
 #include <linux/ptrace.h>
+#include <linux/blkdev.h>
+#include <linux/dcache.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
+#include "lib/include/loop.h"
 
 #define AUDIT if(1)
 
@@ -57,32 +60,71 @@ static struct kprobe kp_mount;
 static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 
     struct block_device *bdev;
+    device *p;
     struct loop_device *lo;
     struct file *backing_file;
     struct path file_path;
     char *file_buff, *file_name;
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+    struct bdev_handle *handle;
+    #endif
     
     char *dev_name = (char *)regs->dx; // dx contiene il terzo argomento della syscall mount, ossia il nome del device
+
+    printk("%s: mount called on block device %s\n", MODNAME, dev_name);
 
     //Verifica se il device è un file device (ossia se il nome inizia con /dev/loop)
     //In tal caso deve recuperare il nome del file associato al device
     if (strncmp(dev_name, "/dev/loop", 9) == 0) {
 
+        preempt_enable();
+
         //Apre il block device tramite il nome. Può essere bloccante (TODO: gestire preemption sistema probing)
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
+        backing_file = bdev_file_open_by_path(dev_name, BLK_OPEN_READ, NULL, NULL);
+        if (IS_ERR(backing_file)) {
+            printk("%s: Failed to open block device with error %ld\n", MODNAME, PTR_ERR(backing_file));
+            return -1;
+        }
+        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+        handle = bdev_open_by_path(dev_name, BLK_OPEN_READ, NULL, NULL);
+        if (IS_ERR(handle)) {
+            printk("%s: Failed to open block device with error %ld\n", MODNAME, PTR_ERR(handle));
+            return -1;
+        }
+        bdev = handle -> bdev;
+        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)
+        bdev = blkdev_get_by_path(dev_name, FMODE_READ, NULL, NULL);
+        if (IS_ERR(bdev)) {
+            printk("%s: Failed to open block device with error %ld\n", MODNAME, PTR_ERR(bdev));
+            return -1;
+        }
+        #else 
         bdev = blkdev_get_by_path(dev_name, FMODE_READ, NULL);
         if (IS_ERR(bdev)) {
             printk("%s: Failed to open block device with error %ld\n", MODNAME, PTR_ERR(bdev));
             return -1;
         }
+        #endif    
 
+        preempt_disable();
+
+        #if LINUX_VERSION_CODE <= KERNEL_VERSION(6,8,0)
         //Recupera i private data del block device
-        lo = bdev->bd_disk->private_data;
+        lo = (struct loop_device *)bdev->bd_disk->private_data;
 
         //Recupera la sessione verso il file associato al device
         backing_file = lo->lo_backing_file;
+        #endif
         if (!backing_file) {
             printk("%s: No backing file attached to loop device %s\n", MODNAME, dev_name);
+            #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
+            bdev_release(backing_file);
+            #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+            bdev_release(handle);
+            #else
             blkdev_put(bdev, FMODE_READ);
+            #endif
             return -1;
         }
 
@@ -94,7 +136,13 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         file_buff = kmalloc(PATH_MAX, GFP_ATOMIC);
         if (!file_buff) {
             path_put(&file_path);
+            #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
+            bdev_release(backing_file);
+            #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+            bdev_release(handle);
+            #else
             blkdev_put(bdev, FMODE_READ);
+            #endif
             return -1;
         }
 
@@ -105,29 +153,31 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         file_name = d_path(&file_path, file_buff, PATH_MAX);
 
         printk("%s: loop device %s is associated with file %s\n", MODNAME, dev_name, file_name);
+        dev_name = file_name; //Aggiorna dev_name con il nome del file associato al device
         kfree(file_buff);
         path_put(&file_path);
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
+        bdev_release(backing_file);
+        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+        bdev_release(handle);
+        #else
         blkdev_put(bdev, FMODE_READ);
-        
-        return 0;
+        #endif
     }
-    
-    printk("%s: mount called on block device %s\n", MODNAME, dev_name);
-
-    return 0;
-    }
-
 
     //Controlla se il device è nella lista dei device con snapshot attivo
-    device *p = head;
+    p = head;
     while (p != NULL) {
         if (strncmp(p->dev_name, dev_name, p->name_size) == 0) {
-            printk("%s: device %s has an active snapshot, preventing mount\n", MODNAME, p->dev_name);
+            printk("%s: (file-)device %s has snapshot service active\n", MODNAME, dev_name);
             //Se il device è nella lista, allora non è possibile montarlo
-            return -EPERM; // Permesso negato
+            return 0; // Permesso negato
         }
         p = p->next;
     }
+
+    printk("%s: device %s has snapshot service not active\n", MODNAME, dev_name);
+    
     return 0;
 }
 

@@ -7,9 +7,9 @@
 int main(int argc, char** argv){
        
     //Test syscall 1
-    syscall(SYSCALL1, "device_1", "test");
+    syscall(SYSCALL1, "/home/matteo/Desktop/SINGLEFILE-FS/image", "test");
     
     //Test syscall 2
-    syscall(SYSCALL2, "device_1", "test");
+    //syscall(SYSCALL2, "device_1", "test");
 	return 0;
 }
