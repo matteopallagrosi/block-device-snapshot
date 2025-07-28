@@ -6,6 +6,7 @@
 #include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/user_namespace.h>
+#include <linux/mnt_idmapping.h>
 #include <linux/string.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
@@ -105,6 +106,64 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 	__this_cpu_write(kprobe_context_pointer, temp);
 
 	return 0;
+}
+
+//Crea un nome per la subdirectory dello snapshot a partire dal path del device
+static void create_name_from_path(char *path)
+{
+    while (*path) {
+        if (*path == '/')
+            *path = '_';
+        path++;
+    }
+}
+
+//Creazione di una subdirectory dentro a /snapshot, utilizzata per memorizzare gli snapshot di un device
+int create_directory(char *name_dir) {
+    
+    struct path parent_path, dir_path;
+    struct dentry *dentry;
+    int err;
+
+    //kern_path risolve il percorso specificato. Se il percorso è valido e accessibile, riempie il campo struct path *path con mount point e dentry.
+    err = kern_path("/snapshot", LOOKUP_DIRECTORY, &parent_path);
+    if (err) {
+        printk("%s: cannot retrieve requested directory\n", MODNAME);
+        return err;
+    }
+
+    //Verifica se la directory snapshot è gia esistente. Se non esiste crea la dentry con quel nome.
+    dentry = lookup_one_len(name_dir, parent_path.dentry, strlen(name_dir));
+    if (IS_ERR(dentry)) {
+        printk("%s: error in lookup dentry %s with error %ld\n", MODNAME, name_dir, PTR_ERR(dentry));
+        path_put(&parent_path);
+        return -1;
+    }
+
+    /*err = vfs_path_lookup(parent_path.dentry, parent_path.mnt, name_dir, LOOKUP_DIRECTORY, &dir_path);
+    if (err < 0) {
+        printk("%s: error in lookup dentry (%d)\n", MODNAME, err);
+        return err;
+    }*/
+
+    // Crea la subdirectory se non esiste (crea inode da associare alla dentry).
+    if (!dentry->d_inode) {
+        err = vfs_mkdir(&nop_mnt_idmap, d_inode(parent_path.dentry), dentry, S_IFDIR | 0755);
+        if (err) {
+            printk("%s: cannot create directory (%d)\n", MODNAME, err);
+            dput(dentry);
+            path_put(&parent_path);
+        }
+        else
+            printk("%s: directory %s succesfully created.\n", MODNAME, name_dir);
+    } else {
+        printk("%s: %s already exists.\n", MODNAME, name_dir);
+    }
+
+    dput(dentry);
+    path_put(&parent_path);
+
+    return 0;
 }
 
 static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
@@ -223,18 +282,24 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         #endif
     }
 
-    //Controlla se il device è nella lista dei device con snapshot attivo
+    //Controlla se il device è nella lista dei device con snapshot attivo (gestisce lettura della lista con rcu)
+    rcu_read_lock();
     p = head;
     while (p != NULL) {
         if (strncmp(p->dev_name, dev_name, p->name_size) == 0) {
             printk("%s: (file-)device %s has snapshot service active\n", MODNAME, dev_name);
-            //Se il device è nella lista, allora non è possibile montarlo
-            return 0; // Permesso negato
+            rcu_read_unlock();
+            //TODO: flaggare il device con servizio snapshot attivo e creare sottodirectory per snapshot
+            create_name_from_path(dev_name);
+            if (!create_directory(dev_name))
+                return -1;
+            return 0;
         }
         p = p->next;
     }
 
     printk("%s: device %s has snapshot service not active\n", MODNAME, dev_name);
+    rcu_read_unlock();
     
     return 0;
 }
@@ -472,6 +537,7 @@ int init_module(void) {
     if (ret != HACKED_ENTRIES) {
         printk("%s: could not hack %d entries (just %d)\n",MODNAME,HACKED_ENTRIES,ret);
         kmem_cache_destroy(cache);
+        unregister_kretprobe(&setup_probe);
         unregister_kprobe(&kp_mount);
         return -1;      
     }
@@ -512,4 +578,7 @@ void cleanup_module(void) {
 
     unregister_kprobe(&kp_mount);
     printk("%s: mount kprobe unregistered\n",MODNAME);
+
+    unregister_kretprobe(&setup_probe);
+    printk("%s: setup kprobe unregistered\n",MODNAME);
 }
