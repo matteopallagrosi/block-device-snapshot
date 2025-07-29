@@ -15,6 +15,7 @@
 #include <linux/ptrace.h>
 #include <linux/blkdev.h>
 #include <linux/dcache.h>
+#include <linux/time.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
 #include "lib/include/loop.h"
@@ -108,14 +109,47 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 	return 0;
 }
 
-//Crea un nome per la subdirectory dello snapshot a partire dal path del device
-static void create_name_from_path(char *path)
-{
+//Crea un nome per la subdirectory dello snapshot a partire dal path del device e dal timestamp corrente
+//La subdirectory avrà il nome <path>_YYYYMMDD_HHMMSS, con timestamp relativo al Coordinated Universal Time (UTC).
+char *create_name_dir_from_path(char *path, struct timespec64 timestamp) {
+
+    struct tm time;
+    char *name, *p;
+    int ret;
+
+    //Allocazionde di memoria non bloccante
+    name = kmalloc(strlen(path) + 17, GFP_ATOMIC);
+    if (!name)
+        return NULL;
+
+    //Sostituisce i caratteri '/' con '_' nel path per creare un nome valido per la directory (gli "/"" infatti verrebbero interpretati come sottodirectory)
+    p = name;
     while (*path) {
         if (*path == '/')
-            *path = '_';
+            *p = '_';
+        else
+            *p = *path;
         path++;
+        p++;
     }
+
+    //Converte il timestamp (tempo trascorso dal 1970) in un formato YYMMDD_HHMMSS
+    time64_to_tm(timestamp.tv_sec, 0, &time);
+
+    //Costruisce la stringa: <path>_YYYYMMDD_HHMMSS
+    ret = snprintf(p, 17, "_%04ld%02d%02d_%02d%02d%02d",
+        time.tm_year + 1900,
+        time.tm_mon + 1,
+        time.tm_mday,
+        time.tm_hour,
+        time.tm_min,
+        time.tm_sec);
+    if (ret !=  16) {
+        kfree(name);
+        return NULL;
+    }
+
+    return name;
 }
 
 //Creazione di una subdirectory dentro a /snapshot, utilizzata per memorizzare gli snapshot di un device
@@ -175,9 +209,13 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     struct file *backing_file;
     struct path file_path;
     char *file_buff, *file_name;
+    struct timespec64 ts;
     #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
     struct bdev_handle *handle;
     #endif
+
+    //Recupera il timestamp corrente
+    ktime_get_real_ts64(&ts);
     
     char *dev_name = (char *)regs->dx; // dx contiene il terzo argomento della syscall mount, ossia il nome del device
 
@@ -192,7 +230,7 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         __this_cpu_write(*kprobe_cpu, NULL);
         preempt_enable();
 
-        //Apre il block device tramite il nome. Può essere bloccante (TODO: gestire preemption sistema probing)
+        //Apre il block device tramite il nome. Può essere bloccante
         #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
         backing_file = bdev_file_open_by_path(dev_name, BLK_OPEN_READ, NULL, NULL);
         if (IS_ERR(backing_file)) {
@@ -290,15 +328,23 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             printk("%s: (file-)device %s has snapshot service active\n", MODNAME, dev_name);
             rcu_read_unlock();
             //TODO: flaggare il device con servizio snapshot attivo e creare sottodirectory per snapshot
-            create_name_from_path(dev_name);
-            if (!create_directory(dev_name))
+            char *name_dir = create_name_dir_from_path(dev_name, ts);
+            if (!name_dir) {
+                printk("%s: failed to create name directory for device %s\n", MODNAME, dev_name);
+                return -ENOMEM;
+            }
+            //Crea la directory per lo snapshot di questo device
+            if (create_directory(name_dir) < 0) {
+                kfree(name_dir);
                 return -1;
+            }
+            kfree(name_dir);
             return 0;
         }
         p = p->next;
     }
 
-    printk("%s: device %s has snapshot service not active\n", MODNAME, dev_name);
+    printk("%s: (file-)device %s has snapshot service not active\n", MODNAME, dev_name);
     rcu_read_unlock();
     
     return 0;
