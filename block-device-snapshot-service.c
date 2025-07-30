@@ -70,6 +70,8 @@ struct kmem_cache *cache;
 static struct kretprobe setup_probe; //probe per gestione variabili per-cpu
 static struct kretprobe *the_retprobe = &setup_probe; 
 static struct kretprobe kp_mount;
+static struct kprobe kp_kill_sb;
+
 
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 int offset = sizeof(struct thread_info);
@@ -378,7 +380,6 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 }
 
 static int mount_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
-    //TODO: inserire snapshot info nella struttura del superblock
     snapshot_info *info;
     struct super_block *sb;
 
@@ -391,6 +392,23 @@ static int mount_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
 
     //Associa l'informazione dello snapshot al superblocco, quindi all'istanza di filesystem montato
     sb->s_fs_info = info;
+
+    return 0;
+}
+
+static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
+    
+    struct super_block *sb;
+
+    printk("%s: kill_sb_pre_hook activated\n", MODNAME);
+
+    sb = (struct super_block *)regs->di;
+
+    //Libera la memoria allocata per il nome della directory dello snapshot
+    kfree(((snapshot_info *)sb->s_fs_info)->name_dir);
+
+    //Libera la memoria allocata per lo snapshot_info associato al superblocco
+    kfree(sb->s_fs_info);
 
     return 0;
 }
@@ -598,6 +616,17 @@ int init_module(void) {
 		return ret;
 	}
 
+    kp_kill_sb.symbol_name = "kill_block_super";
+    kp_kill_sb.pre_handler = (kprobe_pre_handler_t)kill_sb_pre_hook;
+    ret = register_kprobe(&kp_kill_sb);
+    if (ret < 0) {
+		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
+        unregister_kretprobe(&setup_probe);
+        unregister_kretprobe(&kp_mount);
+        kmem_cache_destroy(cache);
+		return ret;
+	}
+
     smp_call_function(run_on_cpu,NULL,1);
 
     if(successful_search_counter != (num_online_cpus() - 1)) {
@@ -605,6 +634,7 @@ int init_module(void) {
 		put_cpu();
 	 	unregister_kretprobe(&setup_probe);
         unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_kill_sb);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -614,6 +644,7 @@ int init_module(void) {
 		put_cpu();
 	 	unregister_kretprobe(&setup_probe);
         unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_kill_sb);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -634,6 +665,7 @@ int init_module(void) {
         kmem_cache_destroy(cache);
         unregister_kretprobe(&setup_probe);
         unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_kill_sb);
         return -1;      
     }
 
@@ -676,4 +708,7 @@ void cleanup_module(void) {
 
     unregister_kretprobe(&setup_probe);
     printk("%s: setup kprobe unregistered\n",MODNAME);
+
+    unregister_kprobe(&kp_kill_sb);
+    printk("%s: kill superblock kprobe unregistered\n",MODNAME);
 }
