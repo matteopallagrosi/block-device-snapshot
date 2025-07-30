@@ -69,7 +69,21 @@ struct kmem_cache *cache;
 
 static struct kretprobe setup_probe; //probe per gestione variabili per-cpu
 static struct kretprobe *the_retprobe = &setup_probe; 
-static struct kprobe kp_mount;
+static struct kretprobe kp_mount;
+
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+int offset = sizeof(struct thread_info);
+#else
+int offset = 0;
+#endif
+
+#define store_address(addr) *(unsigned long*)((void*)current->stack + offset) = addr
+#define load_address(addr) addr = (*(unsigned long*)((void*)current->stack + offset))
+
+typedef struct _snapshot_info {
+    int active;     //flag per indicare se lo snapshot è attivo
+    char *name_dir; //nome della directory in cui salvare lo snapshot
+} snapshot_info;
 
 ///Funzione di cui viene richiesta l'esecuzione alle altre cpu con smp_call_fuction() -> IPI
 void run_on_cpu(void* x) {//this is here just to enable a kprobe on it 
@@ -210,6 +224,7 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     struct path file_path;
     char *file_buff, *file_name;
     struct timespec64 ts;
+    char *name_dir;
     #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
     struct bdev_handle *handle;
     #endif
@@ -220,6 +235,12 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     char *dev_name = (char *)regs->dx; // dx contiene il terzo argomento della syscall mount, ossia il nome del device
 
     printk("%s: mount called on block device %s\n", MODNAME, dev_name);
+
+    //Allocazionde di memoria non bloccante
+    snapshot_info *info = kmalloc(sizeof(snapshot_info), GFP_ATOMIC);
+    if (!info) {
+        return -1;
+    }
 
     //Verifica se il device è un file device (ossia se il nome inizia con /dev/loop)
     //In tal caso deve recuperare il nome del file associato al device
@@ -328,17 +349,20 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             printk("%s: (file-)device %s has snapshot service active\n", MODNAME, dev_name);
             rcu_read_unlock();
             //TODO: flaggare il device con servizio snapshot attivo e creare sottodirectory per snapshot
-            char *name_dir = create_name_dir_from_path(dev_name, ts);
+            name_dir = create_name_dir_from_path(dev_name, ts);
             if (!name_dir) {
-                printk("%s: failed to create name directory for device %s\n", MODNAME, dev_name);
+                printk("%s: failed to create snapshot directory for device %s\n", MODNAME, dev_name);
                 return -ENOMEM;
             }
             //Crea la directory per lo snapshot di questo device
             if (create_directory(name_dir) < 0) {
-                kfree(name_dir);
+                //kfree(name_dir);
                 return -1;
             }
-            kfree(name_dir);
+            //kfree(name_dir);
+            info->active = 1; //lo snapshot è attivo
+            info->name_dir = name_dir;
+            store_address(info);
             return 0;
         }
         p = p->next;
@@ -346,7 +370,28 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 
     printk("%s: (file-)device %s has snapshot service not active\n", MODNAME, dev_name);
     rcu_read_unlock();
-    
+    info->active = 0; //Lo snapshot non è attivo
+
+    store_address(info);
+
+    return 0;
+}
+
+static int mount_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
+    //TODO: inserire snapshot info nella struttura del superblock
+    snapshot_info *info;
+    struct super_block *sb;
+
+    load_address(info);
+
+    printk("%s: mount return hook called - snapshot info active %d, name_dir %s\n", MODNAME, info->active, info->name_dir);
+
+    //Recupera il valore di ritorno della mount_bdev(), ossia il puntatore alla dentry della root del file system montato, e da questo il superblocco
+    sb = ((struct dentry *)regs_return_value(the_regs))->d_sb;
+
+    //Associa l'informazione dello snapshot al superblocco, quindi all'istanza di filesystem montato
+    sb->s_fs_info = info;
+
     return 0;
 }
 
@@ -530,9 +575,11 @@ int init_module(void) {
     }
 
 
-    kp_mount.symbol_name = "mount_bdev";
-    kp_mount.pre_handler = (kprobe_pre_handler_t)mount_pre_hook;
-    ret = register_kprobe(&kp_mount);
+    kp_mount.kp.symbol_name = "mount_bdev";
+    kp_mount.entry_handler = (kretprobe_handler_t)mount_pre_hook;
+    kp_mount.handler = (kretprobe_handler_t)mount_return_hook;
+    kp_mount.maxactive = -1;
+    ret = register_kretprobe(&kp_mount);
     if (ret < 0) {
 		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
         kmem_cache_destroy(cache);
@@ -546,6 +593,8 @@ int init_module(void) {
     ret = register_kretprobe(&setup_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
+        unregister_kretprobe(&kp_mount);
+        kmem_cache_destroy(cache);
 		return ret;
 	}
 
@@ -555,7 +604,7 @@ int init_module(void) {
 	    printk("%s: read hook load failed - number of setup CPUs is %ld - number of remote online CPUs is %d\n", MODNAME, successful_search_counter, num_online_cpus() - 1);
 		put_cpu();
 	 	unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
+        unregister_kretprobe(&kp_mount);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -564,7 +613,7 @@ int init_module(void) {
 		printk("%s: inconsistent value found for refeence offset\n", MODNAME);
 		put_cpu();
 	 	unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
+        unregister_kretprobe(&kp_mount);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -584,7 +633,7 @@ int init_module(void) {
         printk("%s: could not hack %d entries (just %d)\n",MODNAME,HACKED_ENTRIES,ret);
         kmem_cache_destroy(cache);
         unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
+        unregister_kretprobe(&kp_mount);
         return -1;      
     }
 
@@ -622,7 +671,7 @@ void cleanup_module(void) {
     kmem_cache_destroy(cache);
     printk("%s: memcache destroyed\n",MODNAME);
 
-    unregister_kprobe(&kp_mount);
+    unregister_kretprobe(&kp_mount);
     printk("%s: mount kprobe unregistered\n",MODNAME);
 
     unregister_kretprobe(&setup_probe);
