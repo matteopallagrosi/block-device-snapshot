@@ -16,6 +16,9 @@
 #include <linux/blkdev.h>
 #include <linux/dcache.h>
 #include <linux/time.h>
+#include <linux/kdev_t.h>
+#include <linux/hashtable.h>
+#include <linux/buffer_head.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
 #include "lib/include/loop.h"
@@ -53,6 +56,10 @@ unsigned long* reference_offset = 0x0;
 
 #define MAX_DEV_NAME_SIZE 120
 
+#define MAX_BLOCKS 100 //Questo numero coincide con il numero massimo di blocchi previsti per il singlefilefs
+
+#define SNAPSHOT_HASH_BITS 6  // 2^6 = 64 bucket
+
 //dev_name può essere un nome di device oppure il path di un file device
 typedef struct _device{
 	char dev_name[MAX_DEV_NAME_SIZE];
@@ -69,8 +76,9 @@ struct kmem_cache *cache;
 
 static struct kretprobe setup_probe; //probe per gestione variabili per-cpu
 static struct kretprobe *the_retprobe = &setup_probe; 
-static struct kretprobe kp_mount;
+static struct kprobe kp_mount;
 static struct kprobe kp_kill_sb;
+static struct kprobe kp_write;
 
 
 #ifdef CONFIG_THREAD_INFO_IN_TASK
@@ -83,9 +91,20 @@ int offset = 0;
 #define load_address(addr) addr = (*(unsigned long*)((void*)current->stack + offset))
 
 typedef struct _snapshot_info {
-    int active;     //flag per indicare se lo snapshot è attivo
-    char *name_dir; //nome della directory in cui salvare lo snapshot
+    int active;                     //flag per indicare se lo snapshot è attivo
+    char *name_dir;                 //nome della directory in cui salvare lo snapshot
+    int block_updated[MAX_BLOCKS];  //bitmask che tiene traccia dei blocchi updated almeno una volta
 } snapshot_info;
+
+// Entry per la hash table degli snapshot attivi
+struct snapshot_entry {
+    dev_t dev;              // chiave
+    snapshot_info *info;    // valore
+    struct hlist_node node;
+};
+
+DEFINE_HASHTABLE(snapshot_table, SNAPSHOT_HASH_BITS);
+
 
 ///Funzione di cui viene richiesta l'esecuzione alle altre cpu con smp_call_fuction() -> IPI
 void run_on_cpu(void* x) {//this is here just to enable a kprobe on it 
@@ -220,6 +239,7 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 
     unsigned long* kprobe_cpu;
     struct block_device *bdev;
+    dev_t dev;
     device *p;
     struct loop_device *lo;
     struct file *backing_file;
@@ -239,10 +259,17 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     printk("%s: mount called on block device %s\n", MODNAME, dev_name);
 
     //Allocazionde di memoria non bloccante
-    snapshot_info *info = kmalloc(sizeof(snapshot_info), GFP_ATOMIC);
+    snapshot_info *info = kzalloc(sizeof(snapshot_info), GFP_ATOMIC);
     if (!info) {
-        return -1;
+        return -ENOMEM;
     }
+
+    struct snapshot_entry *entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+    if (!entry) {
+        return -ENOMEM;
+    }
+
+    entry->info = info;
 
     //Verifica se il device è un file device (ossia se il nome inizia con /dev/loop)
     //In tal caso deve recuperare il nome del file associato al device
@@ -279,7 +306,10 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             printk("%s: Failed to open block device with error %ld\n", MODNAME, PTR_ERR(bdev));
             return -1;
         }
-        #endif    
+        #endif
+
+        //Recupera il dev_t del block device
+        dev = bdev->bd_dev;
 
         preempt_disable();
         //Recupera l'indirizzo della variabile per-cpu con il contesto di probing
@@ -324,7 +354,7 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             return -1;
         }
 
-        //Rrecupera il path name del file associato al device
+        //Recupera il path name del file associato al device
         //Dalla documentazione -> Note: Callers should use the returned pointer, not the passed
         //in buffer, to use the name! The implementation often starts at an offset
         //into the buffer, and may leave 0 bytes at the start.
@@ -358,40 +388,24 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             }
             //Crea la directory per lo snapshot di questo device
             if (create_directory(name_dir) < 0) {
-                //kfree(name_dir);
                 return -1;
             }
-            //kfree(name_dir);
-            info->active = 1; //lo snapshot è attivo
+            info->active = 1; //Segna lo snapshot come attivo
             info->name_dir = name_dir;
-            store_address(info);
+
+            //Inserisce le info sullo snapshot nella hash table
+            entry->dev = dev;
+            hash_add(snapshot_table, &entry->node, dev);
             return 0;
         }
+
         p = p->next;
     }
 
     printk("%s: (file-)device %s has snapshot service not active\n", MODNAME, dev_name);
     rcu_read_unlock();
-    info->active = 0; //Lo snapshot non è attivo
-
-    store_address(info);
-
-    return 0;
-}
-
-static int mount_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
-    snapshot_info *info;
-    struct super_block *sb;
-
-    load_address(info);
-
-    printk("%s: mount return hook called - snapshot info active %d, name_dir %s\n", MODNAME, info->active, info->name_dir);
-
-    //Recupera il valore di ritorno della mount_bdev(), ossia il puntatore alla dentry della root del file system montato, e da questo il superblocco
-    sb = ((struct dentry *)regs_return_value(the_regs))->d_sb;
-
-    //Associa l'informazione dello snapshot al superblocco, quindi all'istanza di filesystem montato
-    sb->s_fs_info = info;
+    info->active = 0;
+    hash_add(snapshot_table, &entry->node, dev);
 
     return 0;
 }
@@ -399,16 +413,49 @@ static int mount_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
 static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     
     struct super_block *sb;
+    dev_t dev;
 
     printk("%s: kill_sb_pre_hook activated\n", MODNAME);
 
     sb = (struct super_block *)regs->di;
 
-    //Libera la memoria allocata per il nome della directory dello snapshot
-    kfree(((snapshot_info *)sb->s_fs_info)->name_dir);
+    dev = sb->s_bdev->bd_dev;
 
-    //Libera la memoria allocata per lo snapshot_info associato al superblocco
-    kfree(sb->s_fs_info);
+    //Libera la memoria allocata per lo snapshot_info
+    struct snapshot_entry *entry;
+    hash_for_each_possible(snapshot_table, entry, node, dev) {
+        if (entry->dev == dev) {
+            if (entry->info->name_dir!=NULL) {
+                kfree(entry->info->name_dir); //Libera il nome della directory dello snapshot
+            }
+            kfree(entry->info); //Libera la struttura snapshot_info
+            hash_del(&entry->node);
+            kfree(entry);
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
+
+    snapshot_info *info;
+    struct snapshot_entry *entry;
+    
+    printk("%s: write_pre_hook activated\n", MODNAME);
+
+    //Recupera il puntatore al buffer_head, da cui recupera il block_device, e quindi dev_t (major e minor)
+    dev_t dev = ((struct buffer_head *)regs->di)->b_bdev->bd_dev;
+
+    hash_for_each_possible(snapshot_table, entry, node, dev) {
+        if (entry->dev == dev)
+            info = entry->info;
+    }
+
+    if (info != NULL && info->active) {
+        printk("%s: write operation on device %d:%d tracked by snapshot service on directory %s\n", MODNAME, MAJOR(dev), MINOR(dev), info->name_dir);
+    }
 
     return 0;
 }
@@ -593,11 +640,9 @@ int init_module(void) {
     }
 
 
-    kp_mount.kp.symbol_name = "mount_bdev";
-    kp_mount.entry_handler = (kretprobe_handler_t)mount_pre_hook;
-    kp_mount.handler = (kretprobe_handler_t)mount_return_hook;
-    kp_mount.maxactive = -1;
-    ret = register_kretprobe(&kp_mount);
+    kp_mount.symbol_name = "mount_bdev";
+    kp_mount.pre_handler = (kprobe_pre_handler_t)mount_pre_hook;
+    ret = register_kprobe(&kp_mount);
     if (ret < 0) {
 		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
         kmem_cache_destroy(cache);
@@ -611,7 +656,7 @@ int init_module(void) {
     ret = register_kretprobe(&setup_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
-        unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_mount);
         kmem_cache_destroy(cache);
 		return ret;
 	}
@@ -620,9 +665,21 @@ int init_module(void) {
     kp_kill_sb.pre_handler = (kprobe_pre_handler_t)kill_sb_pre_hook;
     ret = register_kprobe(&kp_kill_sb);
     if (ret < 0) {
-		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
+		printk("%s: hook init failed for kill_block_super, returned %d\n", MODNAME, ret);
         unregister_kretprobe(&setup_probe);
-        unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_mount);
+        kmem_cache_destroy(cache);
+		return ret;
+	}
+
+    kp_write.symbol_name = "write_dirty_buffer";
+    kp_write.pre_handler = (kprobe_pre_handler_t)write_pre_hook;
+    ret = register_kprobe(&kp_write);
+    if (ret < 0) {
+		printk("%s: hook init failed for vfs_write, returned %d\n", MODNAME, ret);
+        unregister_kretprobe(&setup_probe);
+        unregister_kprobe(&kp_mount);
+        unregister_kprobe(&kp_kill_sb);
         kmem_cache_destroy(cache);
 		return ret;
 	}
@@ -633,18 +690,20 @@ int init_module(void) {
 	    printk("%s: read hook load failed - number of setup CPUs is %ld - number of remote online CPUs is %d\n", MODNAME, successful_search_counter, num_online_cpus() - 1);
 		put_cpu();
 	 	unregister_kretprobe(&setup_probe);
-        unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_mount);
         unregister_kprobe(&kp_kill_sb);
+        unregister_kprobe(&kp_write);
         kmem_cache_destroy(cache);
 		return -1;
 	}
 
     if (reference_offset == 0x0){
-		printk("%s: inconsistent value found for refeence offset\n", MODNAME);
+		printk("%s: inconsistent value found for reference offset\n", MODNAME);
 		put_cpu();
 	 	unregister_kretprobe(&setup_probe);
-        unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_mount);
         unregister_kprobe(&kp_kill_sb);
+        unregister_kprobe(&kp_write);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -664,8 +723,9 @@ int init_module(void) {
         printk("%s: could not hack %d entries (just %d)\n",MODNAME,HACKED_ENTRIES,ret);
         kmem_cache_destroy(cache);
         unregister_kretprobe(&setup_probe);
-        unregister_kretprobe(&kp_mount);
+        unregister_kprobe(&kp_mount);
         unregister_kprobe(&kp_kill_sb);
+        unregister_kprobe(&kp_write);
         return -1;      
     }
 
@@ -703,7 +763,7 @@ void cleanup_module(void) {
     kmem_cache_destroy(cache);
     printk("%s: memcache destroyed\n",MODNAME);
 
-    unregister_kretprobe(&kp_mount);
+    unregister_kprobe(&kp_mount);
     printk("%s: mount kprobe unregistered\n",MODNAME);
 
     unregister_kretprobe(&setup_probe);
@@ -711,4 +771,7 @@ void cleanup_module(void) {
 
     unregister_kprobe(&kp_kill_sb);
     printk("%s: kill superblock kprobe unregistered\n",MODNAME);
+
+    unregister_kprobe(&kp_write);
+    printk("%s: write kprobe unregistered\n",MODNAME);
 }
