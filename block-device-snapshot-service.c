@@ -19,6 +19,7 @@
 #include <linux/kdev_t.h>
 #include <linux/hashtable.h>
 #include <linux/buffer_head.h>
+#include <linux/workqueue.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
 #include "lib/include/loop.h"
@@ -105,6 +106,14 @@ struct snapshot_entry {
 
 DEFINE_HASHTABLE(snapshot_table, SNAPSHOT_HASH_BITS);
 
+struct packed_work {
+    char *data;               // copia del contenuto del blocco
+    size_t size;
+    sector_t block_nr;        
+    char name_dir[PATH_MAX];
+    struct work_struct the_work;
+};
+
 
 ///Funzione di cui viene richiesta l'esecuzione alle altre cpu con smp_call_fuction() -> IPI
 void run_on_cpu(void* x) {//this is here just to enable a kprobe on it 
@@ -190,7 +199,7 @@ char *create_name_dir_from_path(char *path, struct timespec64 timestamp) {
 //Creazione di una subdirectory dentro a /snapshot, utilizzata per memorizzare gli snapshot di un device
 int create_directory(char *name_dir) {
     
-    struct path parent_path, dir_path;
+    struct path parent_path;
     struct dentry *dentry;
     int err;
 
@@ -438,23 +447,72 @@ static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     return 0;
 }
 
+void snapshot_worker(struct work_struct *the_work)
+{
+    struct packed_work *work = container_of(the_work, struct packed_work, the_work);
+
+    printk("%s: snapshot_worker: saving block %llu to dir %s\n",
+           MODNAME, (unsigned long long)work->block_nr, work->name_dir);
+
+    // TODO: salva work->data su file con nome <work->block_nr> in work->name_dir
+
+    kfree(work->data);
+    kfree(work);
+}
+
 static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 
     snapshot_info *info;
     struct snapshot_entry *entry;
+    struct buffer_head *bh;
     
     printk("%s: write_pre_hook activated\n", MODNAME);
 
-    //Recupera il puntatore al buffer_head, da cui recupera il block_device, e quindi dev_t (major e minor)
-    dev_t dev = ((struct buffer_head *)regs->di)->b_bdev->bd_dev;
+    //Recupera il puntatore al buffer_head, da cui recupera il block number e il block_device, e quindi dev_t (major e minor)
+    bh = (struct buffer_head *)regs->di;
+    dev_t dev = bh->b_bdev->bd_dev;
+    sector_t block_nr = bh->b_blocknr;
 
+    //Recupera lo snapshot_info per il filesystem montato
     hash_for_each_possible(snapshot_table, entry, node, dev) {
         if (entry->dev == dev)
             info = entry->info;
     }
 
-    if (info != NULL && info->active) {
+    //Se lo snapshot è attivo, e il blocco non è stato precedentemente updated, deve produrre lo snapshot (deferred work)
+    if (info != NULL && info->active && info->block_updated[block_nr] == 0) {
         printk("%s: write operation on device %d:%d tracked by snapshot service on directory %s\n", MODNAME, MAJOR(dev), MINOR(dev), info->name_dir);
+
+        info->block_updated[block_nr] = 1; //Segna il blocco come updated almeno una volta
+
+        //TODO: registrare il deferred work che realizza lo snapshot del blocco modificato
+        struct packed_work *work;
+
+        work = kzalloc(sizeof(struct packed_work), GFP_ATOMIC);
+        if (!work) {
+            printk("%s: cannot allocate deferred work\n", MODNAME);
+            return -ENOMEM;
+        }
+
+
+        // Copia il contenuto del blocco
+        work->size = bh->b_size;
+        work->data = kzalloc(work->size, GFP_ATOMIC);
+        if (!work->data) {
+            kfree(work);
+            printk("%s: cannot allocate block data for deferred work\n", MODNAME);
+            return -ENOMEM;
+        }
+        memcpy(work->data, bh->b_data, work->size);
+
+        work->block_nr = block_nr;
+
+        //Copia il nome della directory su cui verrò realizzato lo snapshot in deferred work
+        snprintf(work->name_dir, sizeof(work->name_dir), "/snapshot/%s", info->name_dir);
+
+        INIT_WORK(&work->the_work, snapshot_worker);
+        schedule_work(&work->the_work);
+
     }
 
     return 0;
