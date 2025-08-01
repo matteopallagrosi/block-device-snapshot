@@ -80,6 +80,7 @@ static struct kretprobe *the_retprobe = &setup_probe;
 static struct kprobe kp_mount;
 static struct kprobe kp_kill_sb;
 static struct kprobe kp_write;
+static struct kretprobe bread_probe;
 
 
 #ifdef CONFIG_THREAD_INFO_IN_TASK
@@ -447,15 +448,81 @@ static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     return 0;
 }
 
+//Intercetta il buffer_head ritornato dalla __bread_gfp per registrare il contenuto originale
+static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
+
+    snapshot_info *info;
+    struct snapshot_entry *entry;
+    char *original_block;
+
+    struct buffer_head *bh = (struct buffer_head *)regs_return_value(the_regs);
+    dev_t dev = bh->b_bdev->bd_dev;
+    sector_t block_nr = bh->b_blocknr;
+
+    //TODO: se il file è aperto in sola lettura (o il filesystem è montato in sola lettura) non deve fare nulla
+
+    //Recupera lo snapshot_info per il filesystem montato
+    hash_for_each_possible(snapshot_table, entry, node, dev) {
+    if (entry->dev == dev)
+        info = entry->info;
+    }
+
+    //Se è attivo il servizio di snapshot e il blocco non è stato precedentemente updated, registra il contenuto originale qualora venisse successivamente modificato
+    if (info != NULL && info->active && info->block_updated[block_nr] == 0) {
+       
+        original_block = kzalloc(bh->b_size, GFP_ATOMIC);
+        if (!original_block) {
+            printk("%s: cannot allocate original block data\n", MODNAME);
+            return -ENOMEM;
+        }
+
+        // Copia il contenuto del blocco in un buffer
+        memcpy(original_block, bh->b_data, bh->b_size);
+
+        store_address(original_block);
+    }
+
+    return 0;
+}
+
 void snapshot_worker(struct work_struct *the_work)
 {
     struct packed_work *work = container_of(the_work, struct packed_work, the_work);
+    struct file *file;
+    char *filepath;
+    int ret;
 
     printk("%s: snapshot_worker: saving block %llu to dir %s\n",
            MODNAME, (unsigned long long)work->block_nr, work->name_dir);
 
-    // TODO: salva work->data su file con nome <work->block_nr> in work->name_dir
+    //Alloca path: /snapshot/<name_dir>/<block_nr>
+    filepath = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!filepath) {
+        printk("%s: failed to allocate filepath buffer\n", MODNAME);
+        goto out;
+    }
 
+    snprintf(filepath, PATH_MAX, "%s/%llu", work->name_dir,
+             (unsigned long long)work->block_nr);
+
+    //Crea il file per mantenere lo snapshot del blocco
+    file = filp_open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (IS_ERR(file)) {
+        printk("%s: open snapshot file failed: %ld\n", MODNAME, PTR_ERR(file));
+        goto out_free;
+    }
+
+    //Registra lo snapshot
+    ret = kernel_write(file, work->data, work->size, &file->f_pos);
+    if (ret < 0)
+        printk("%s: write snapshot to file failed: %d\n", MODNAME, ret);
+
+    filp_close(file, NULL);
+
+out_free:
+    kfree(filepath);
+
+out:    
     kfree(work->data);
     kfree(work);
 }
@@ -465,6 +532,7 @@ static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     snapshot_info *info;
     struct snapshot_entry *entry;
     struct buffer_head *bh;
+    char *original_block;
     
     printk("%s: write_pre_hook activated\n", MODNAME);
 
@@ -494,25 +562,20 @@ static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             return -ENOMEM;
         }
 
+        //Recupera il contenuto originale del blocco
+        load_address(original_block);
 
-        // Copia il contenuto del blocco
+        // Copia il contenuto del blocco nel buffer per il deferred work
         work->size = bh->b_size;
-        work->data = kzalloc(work->size, GFP_ATOMIC);
-        if (!work->data) {
-            kfree(work);
-            printk("%s: cannot allocate block data for deferred work\n", MODNAME);
-            return -ENOMEM;
-        }
-        memcpy(work->data, bh->b_data, work->size);
+        work->data = original_block;
 
         work->block_nr = block_nr;
 
-        //Copia il nome della directory su cui verrò realizzato lo snapshot in deferred work
+        //Copia il nome della directory su cui verrà realizzato lo snapshot in deferred work
         snprintf(work->name_dir, sizeof(work->name_dir), "/snapshot/%s", info->name_dir);
 
         INIT_WORK(&work->the_work, snapshot_worker);
         schedule_work(&work->the_work);
-
     }
 
     return 0;
@@ -742,6 +805,20 @@ int init_module(void) {
 		return ret;
 	}
 
+    bread_probe.kp.symbol_name = "__bread_gfp";
+	bread_probe.handler = (kretprobe_handler_t)bread_return_hook;
+	bread_probe.entry_handler = NULL;
+	bread_probe.maxactive = -1;
+    ret = register_kretprobe(&bread_probe);
+	if (ret < 0) {
+		printk("%s: hook init failed for the bread probe, returned %d\n", MODNAME, ret);
+        unregister_kretprobe(&setup_probe);
+        unregister_kprobe(&kp_mount);
+        unregister_kprobe(&kp_kill_sb);
+        kmem_cache_destroy(cache);
+		return ret;
+	}
+
     smp_call_function(run_on_cpu,NULL,1);
 
     if(successful_search_counter != (num_online_cpus() - 1)) {
@@ -751,6 +828,7 @@ int init_module(void) {
         unregister_kprobe(&kp_mount);
         unregister_kprobe(&kp_kill_sb);
         unregister_kprobe(&kp_write);
+        unregister_kretprobe(&bread_probe);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -762,6 +840,7 @@ int init_module(void) {
         unregister_kprobe(&kp_mount);
         unregister_kprobe(&kp_kill_sb);
         unregister_kprobe(&kp_write);
+        unregister_kretprobe(&bread_probe);
         kmem_cache_destroy(cache);
 		return -1;
 	}
@@ -784,6 +863,7 @@ int init_module(void) {
         unregister_kprobe(&kp_mount);
         unregister_kprobe(&kp_kill_sb);
         unregister_kprobe(&kp_write);
+        unregister_kretprobe(&bread_probe);
         return -1;      
     }
 
@@ -832,4 +912,7 @@ void cleanup_module(void) {
 
     unregister_kprobe(&kp_write);
     printk("%s: write kprobe unregistered\n",MODNAME);
+
+    unregister_kretprobe(&bread_probe);
+    printk("%s: bread kprobe unregistered\n",MODNAME);
 }
