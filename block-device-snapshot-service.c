@@ -760,14 +760,12 @@ int init_module(void) {
             return -ENOMEM;
     }
 
-
     kp_mount.symbol_name = "mount_bdev";
     kp_mount.pre_handler = (kprobe_pre_handler_t)mount_pre_hook;
     ret = register_kprobe(&kp_mount);
     if (ret < 0) {
 		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
-        kmem_cache_destroy(cache);
-		return ret;
+        goto err_5;
 	}
 
     setup_probe.kp.symbol_name = setup_target_func;
@@ -777,9 +775,7 @@ int init_module(void) {
     ret = register_kretprobe(&setup_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
-        unregister_kprobe(&kp_mount);
-        kmem_cache_destroy(cache);
-		return ret;
+        goto err_4;
 	}
 
     kp_kill_sb.symbol_name = "kill_block_super";
@@ -787,10 +783,7 @@ int init_module(void) {
     ret = register_kprobe(&kp_kill_sb);
     if (ret < 0) {
 		printk("%s: hook init failed for kill_block_super, returned %d\n", MODNAME, ret);
-        unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
-        kmem_cache_destroy(cache);
-		return ret;
+        goto err_3;
 	}
 
     kp_write.symbol_name = "write_dirty_buffer";
@@ -798,11 +791,7 @@ int init_module(void) {
     ret = register_kprobe(&kp_write);
     if (ret < 0) {
 		printk("%s: hook init failed for vfs_write, returned %d\n", MODNAME, ret);
-        unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
-        unregister_kprobe(&kp_kill_sb);
-        kmem_cache_destroy(cache);
-		return ret;
+        goto err_2;
 	}
 
     bread_probe.kp.symbol_name = "__bread_gfp";
@@ -812,11 +801,7 @@ int init_module(void) {
     ret = register_kretprobe(&bread_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the bread probe, returned %d\n", MODNAME, ret);
-        unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
-        unregister_kprobe(&kp_kill_sb);
-        kmem_cache_destroy(cache);
-		return ret;
+        goto err_1;
 	}
 
     smp_call_function(run_on_cpu,NULL,1);
@@ -824,25 +809,14 @@ int init_module(void) {
     if(successful_search_counter != (num_online_cpus() - 1)) {
 	    printk("%s: read hook load failed - number of setup CPUs is %ld - number of remote online CPUs is %d\n", MODNAME, successful_search_counter, num_online_cpus() - 1);
 		put_cpu();
-	 	unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
-        unregister_kprobe(&kp_kill_sb);
-        unregister_kprobe(&kp_write);
-        unregister_kretprobe(&bread_probe);
-        kmem_cache_destroy(cache);
-		return -1;
+        goto err_0;
 	}
 
     if (reference_offset == 0x0){
 		printk("%s: inconsistent value found for reference offset\n", MODNAME);
 		put_cpu();
-	 	unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
-        unregister_kprobe(&kp_kill_sb);
-        unregister_kprobe(&kp_write);
-        unregister_kretprobe(&bread_probe);
-        kmem_cache_destroy(cache);
-		return -1;
+        goto err_0;
+
 	}
 
     //La cpu corrente su cui sta eseguendo la init è l'unica non colpita dall'IPI, quindi questo thread setta la varibaile per-cpu prendendo l'offset impostato da una qualunque altra cpu.
@@ -858,13 +832,7 @@ int init_module(void) {
 
     if (ret != HACKED_ENTRIES) {
         printk("%s: could not hack %d entries (just %d)\n",MODNAME,HACKED_ENTRIES,ret);
-        kmem_cache_destroy(cache);
-        unregister_kretprobe(&setup_probe);
-        unregister_kprobe(&kp_mount);
-        unregister_kprobe(&kp_kill_sb);
-        unregister_kprobe(&kp_write);
-        unregister_kretprobe(&bread_probe);
-        return -1;      
+        goto err_0;    
     }
 
     unprotect_memory();
@@ -878,6 +846,21 @@ int init_module(void) {
     printk("%s: all new system-calls correctly installed on sys-call table\n",MODNAME);
 
     return 0;
+
+err_0:
+    unregister_kretprobe(&bread_probe);   
+err_1:
+    unregister_kprobe(&kp_write);
+err_2:
+    unregister_kprobe(&kp_kill_sb);
+err_3:
+    unregister_kretprobe(&setup_probe);
+err_4:
+    unregister_kprobe(&kp_mount);
+err_5:
+    kmem_cache_destroy(cache);
+
+    return -1;
 
 }
 
