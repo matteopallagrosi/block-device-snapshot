@@ -880,10 +880,6 @@ void cleanup_module(void) {
     protect_memory();
     printk("%s: sys-call table restored to its original content\n",MODNAME);
 
-    //TODO: rimuovere  tutti i nodi della lista dei device prima di distruggere la memcache
-    kmem_cache_destroy(cache);
-    printk("%s: memcache destroyed\n",MODNAME);
-
     unregister_kprobe(&kp_mount);
     printk("%s: mount kprobe unregistered\n",MODNAME);
 
@@ -898,4 +894,14 @@ void cleanup_module(void) {
 
     unregister_kretprobe(&bread_probe);
     printk("%s: bread kprobe unregistered\n",MODNAME);
+
+    //Rimuove eventuali nodi ancora presenti nella lista dei device (per mancata invocazione della deactivate_snapshot) prima di distruggere la memcache
+    device *p;
+    while (head != NULL) {
+        p = head;
+        head = head->next;
+        kmem_cache_free(cache, p);
+    }
+    kmem_cache_destroy(cache);
+    printk("%s: memcache destroyed\n",MODNAME);
 }
