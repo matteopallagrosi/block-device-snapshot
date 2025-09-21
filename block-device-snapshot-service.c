@@ -95,7 +95,7 @@ int offset = 0;
 typedef struct _snapshot_info {
     int active;                     //flag per indicare se lo snapshot è attivo
     char *name_dir;                 //nome della directory in cui salvare lo snapshot
-    int block_updated[MAX_BLOCKS];  //bitmask che tiene traccia dei blocchi updated almeno una volta
+    bool block_updated[MAX_BLOCKS]; //bitmask che tiene traccia dei blocchi updated almeno una volta
 } snapshot_info;
 
 // Entry per la hash table degli snapshot attivi
@@ -264,7 +264,7 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     //Recupera il timestamp corrente
     ktime_get_real_ts64(&ts);
     
-    char *dev_name = (char *)regs->dx; // dx contiene il terzo argomento della syscall mount, ossia il nome del device
+    char *dev_name = (char *)regs->dx; // dx contiene il terzo argomento della mount_bdev, ossia il nome del device
 
     printk("%s: mount called on block device %s\n", MODNAME, dev_name);
 
@@ -383,6 +383,12 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         #endif
     }
 
+    //Se il filesystem è montato in sola lettura non è necessario realizzare gli snapshot
+    unsigned long flags = regs->si; //si contiene il secondo argomento della mount_bdev, ossia i flags
+    if (flags & MS_RDONLY) {
+        goto not_active;
+    }
+
     //Controlla se il device è nella lista dei device con snapshot attivo (gestisce lettura della lista con rcu)
     rcu_read_lock();
     p = head;
@@ -390,10 +396,9 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         if (strncmp(p->dev_name, dev_name, p->name_size) == 0) {
             printk("%s: (file-)device %s has snapshot service active\n", MODNAME, dev_name);
             rcu_read_unlock();
-            //TODO: flaggare il device con servizio snapshot attivo e creare sottodirectory per snapshot
             name_dir = create_name_dir_from_path(dev_name, ts);
             if (!name_dir) {
-                printk("%s: failed to create snapshot directory for device %s\n", MODNAME, dev_name);
+                printk("%s: failed to create snapshot directory name for device %s\n", MODNAME, dev_name);
                 return -ENOMEM;
             }
             //Crea la directory per lo snapshot di questo device
@@ -412,9 +417,11 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         p = p->next;
     }
 
+not_active:
     printk("%s: (file-)device %s has snapshot service not active\n", MODNAME, dev_name);
     rcu_read_unlock();
     info->active = 0;
+    entry->dev = dev;
     hash_add(snapshot_table, &entry->node, dev);
 
     return 0;
@@ -461,6 +468,8 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
 
     //TODO: se il file è aperto in sola lettura (o il filesystem è montato in sola lettura) non deve fare nulla
 
+    //TODO: se questa read non è seguita da una write non deve fare nulla (non serve bufferizzare il contenuto originale)
+
     //Recupera lo snapshot_info per il filesystem montato
     hash_for_each_possible(snapshot_table, entry, node, dev) {
     if (entry->dev == dev)
@@ -468,7 +477,7 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
     }
 
     //Se è attivo il servizio di snapshot e il blocco non è stato precedentemente updated, registra il contenuto originale qualora venisse successivamente modificato
-    if (info != NULL && info->active && info->block_updated[block_nr] == 0) {
+    if (info != NULL && info->active && !info->block_updated[block_nr]) {
        
         original_block = kzalloc(bh->b_size, GFP_ATOMIC);
         if (!original_block) {
@@ -547,13 +556,10 @@ static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             info = entry->info;
     }
 
-    //Se lo snapshot è attivo, e il blocco non è stato precedentemente updated, deve produrre lo snapshot (deferred work)
-    if (info != NULL && info->active && info->block_updated[block_nr] == 0) {
+    //Se lo snapshot è attivo, e il blocco non è stato precedentemente updated, lo imposta come updated e realizza lo snapshot (deferred work)
+    if (info != NULL && info->active && !__atomic_test_and_set(&info->block_updated[block_nr], __ATOMIC_SEQ_CST)) {
         printk("%s: write operation on device %d:%d tracked by snapshot service on directory %s\n", MODNAME, MAJOR(dev), MINOR(dev), info->name_dir);
 
-        info->block_updated[block_nr] = 1; //Segna il blocco come updated almeno una volta
-
-        //TODO: registrare il deferred work che realizza lo snapshot del blocco modificato
         struct packed_work *work;
 
         work = kzalloc(sizeof(struct packed_work), GFP_ATOMIC);
@@ -574,6 +580,7 @@ static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         //Copia il nome della directory su cui verrà realizzato lo snapshot in deferred work
         snprintf(work->name_dir, sizeof(work->name_dir), "/snapshot/%s", info->name_dir);
 
+        //Registra il deferred work che realizza lo snapshot del blocco modificato
         INIT_WORK(&work->the_work, snapshot_worker);
         schedule_work(&work->the_work);
     }
@@ -863,8 +870,6 @@ err_5:
     return -1;
 
 }
-
-
 
 //Rimozione del modulo
 void cleanup_module(void) {
