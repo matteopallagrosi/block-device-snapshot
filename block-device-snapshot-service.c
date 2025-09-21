@@ -3,6 +3,7 @@
 #include <linux/syscalls.h>
 #include <linux/version.h>
 #include <linux/fs.h>
+#include <uapi/linux/mount.h>
 #include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/user_namespace.h>
@@ -384,7 +385,7 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     }
 
     //Se il filesystem è montato in sola lettura non è necessario realizzare gli snapshot
-    unsigned long flags = regs->si; //si contiene il secondo argomento della mount_bdev, ossia i flags
+    int flags = regs->si; //si contiene il secondo argomento della mount_bdev, ossia i flags
     if (flags & MS_RDONLY) {
         goto not_active;
     }
@@ -417,9 +418,10 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         p = p->next;
     }
 
+    rcu_read_unlock();
+
 not_active:
     printk("%s: (file-)device %s has snapshot service not active\n", MODNAME, dev_name);
-    rcu_read_unlock();
     info->active = 0;
     entry->dev = dev;
     hash_add(snapshot_table, &entry->node, dev);
