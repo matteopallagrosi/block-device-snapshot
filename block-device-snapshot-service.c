@@ -461,16 +461,59 @@ static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     struct snapshot_entry *entry;
     hash_for_each_possible(snapshot_table, entry, node, dev) {
         if (entry->dev == dev) {
+            //Se non è stata realizzata alcuna modifica sul filesystem montato rimuove la sottodirectory per lo snapshot
+            if (entry->info->active) {
+                int remove_dir = 1;
+                for (int i = 0; i < MAX_BLOCKS; i++) {
+                    if (entry->info->block_updated[i]) {
+                        remove_dir = 0;
+                        break;
+                    }
+                }
+
+                if (remove_dir) {
+                    char *fullpath = kmalloc(PATH_MAX, GFP_KERNEL);
+                    if (!fullpath) {
+                        printk("%s: cannot allocate memory while removing snapshot directory\n", MODNAME);
+                        return -ENOMEM;
+                    }
+                    
+                    snprintf(fullpath, PATH_MAX, "/snapshot/%s", entry->info->name_dir);
+
+                    struct path path;
+                    int err = kern_path(fullpath, LOOKUP_FOLLOW, &path);
+                    if (err) {
+                        printk("%s: unable to remove snapshot dir %s (err=%d)\n", MODNAME, fullpath, err);
+                        kfree(fullpath);
+                        return err;
+                    }
+
+                    struct dentry *dentry = path.dentry;
+                    struct inode *dir = d_inode(dentry->d_parent);
+
+                    inode_lock(dir);
+                    err = vfs_rmdir(&nop_mnt_idmap, dir, dentry);
+                    inode_unlock(dir);
+                    path_put(&path);
+                    if (err) {
+                        printk("%s: unable to remove snapshot dir %s (err=%d)\n", MODNAME, entry->info->name_dir, err);
+                    }
+                }
+            }
+ 
             if (entry->info->name_dir!=NULL) {
                 kfree(entry->info->name_dir); //Libera il nome della directory dello snapshot
             }
-            if (entry->info->ctx->index != NULL) {
-                filp_close(entry->info->ctx->index, NULL); //Chiude il file index
+            //Rimuove le info di contesto per il salvataggio dei file di snapshot
+            if (entry->info->ctx!=NULL) {
+                if (entry->info->ctx->index != NULL) {
+                    filp_close(entry->info->ctx->index, NULL); //Chiude il file index
+                }
+                if (entry->info->ctx->data != NULL) {
+                    filp_close(entry->info->ctx->data, NULL); //Chiude il file dati
+                }
+                kfree(entry->info->ctx);
             }
-            if (entry->info->ctx->data != NULL) {
-                filp_close(entry->info->ctx->data, NULL); //Chiude il file dati
-            }
-            kfree(entry->info->ctx);
             kfree(entry->info); //Libera la struttura snapshot_info
             hash_del(&entry->node);
             kfree(entry);
