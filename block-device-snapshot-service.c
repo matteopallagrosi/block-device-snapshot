@@ -576,7 +576,7 @@ void snapshot_worker(struct work_struct *the_work)
     //Scrive i metadati per gestire lo snapshot del blocco nell’indice
     idx_len = snprintf(index_entry, sizeof(index_entry), "%llu %llu %zu\n", (unsigned long long)work->block_nr, (unsigned long long)offset, work->size);
 
-    ret = kernel_write(ctx->index, index_entry, idx_len, ctx->index->f_pos);
+    ret = kernel_write(ctx->index, index_entry, idx_len, &ctx->index->f_pos);
     if (ret < 0) {
         printk("%s: write snapshot index failed: %d\n", MODNAME, ret);
     }
