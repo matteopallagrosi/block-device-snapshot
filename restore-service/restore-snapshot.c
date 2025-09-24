@@ -59,66 +59,84 @@ int find_snapshots(const char *prefix, char snapshot_paths[][PATH_MAX]) {
 
 // Ripristina i blocchi dalla directory snapshot_dir sul device file_path
 int restore_snapshot(const char *snapshot_dir, const char *file_path) {
-    DIR *dir;
-    struct dirent *entry;
+    
+    char data_path[PATH_MAX];
+    char index_path[PATH_MAX];
+    unsigned long long block_num, offset;
+    size_t size;
+    char line[256];
+    char buffer[BLOCK_SIZE];
+    ssize_t read_bytes;
 
-    dir = opendir(snapshot_dir);
-    if (!dir) {
-        perror("Error while opening snapshot directory");
+    snprintf(index_path, sizeof(index_path), "%s/index", snapshot_dir);
+    snprintf(data_path, sizeof(data_path), "%s/data", snapshot_dir);
+
+    FILE *index = fopen(index_path, "r");
+    if (!index) {
+        perror("Error while opening snapshot index");
+        return -1;
+    }
+
+    int data = open(data_path, O_RDONLY);
+    if (data < 0) {
+        perror("Error while opening snapshot data");
+        fclose(index);
         return -1;
     }
 
     int device_fd = open(file_path, O_WRONLY);
     if (device_fd < 0) {
-        perror("Error while opening file device");
+        perror("Error while opening device file");
+        close(data);
+        fclose(index);
         return -1;
     }
 
-    printf("Restoring from: %s -> %s\n", snapshot_dir, file_path);
+    printf("Restoring snapshot from: %s -> %s\n", snapshot_dir, file_path);
 
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG) continue;
-
-        //Recupera il numero del blocco dal nome del file
-        int block_num = atoi(entry->d_name);
-        if (block_num < 0) continue;
-
-        char block_path[PATH_MAX];
-        snprintf(block_path, sizeof(block_path), "%s/%s", snapshot_dir, entry->d_name);
-
-        int block_fd = open(block_path, O_RDONLY);
-        if (block_fd < 0) {
-            perror("Error while opening block file snapshot");
-            return -1;
-        }
-        
-        //Legge il contenuto originale del blocco dal file di snapshot
-        char buffer[BLOCK_SIZE];
-        ssize_t read_bytes = read(block_fd, buffer, BLOCK_SIZE);
-        close(block_fd);
-
-        if (read_bytes != BLOCK_SIZE) {
-            fprintf(stderr, "Error while reading block %d (%zd bytes read)\n", block_num, read_bytes);
-            return -1;
+    while (fgets(line, sizeof(line), index)) {
+        if (sscanf(line, "%llu %llu %zu", &block_num, &offset, &size) != 3) {
+            fprintf(stderr, "Malformed index entry: %s", line);
+            continue;
         }
 
-        off_t offset = (off_t)block_num * BLOCK_SIZE;
-        if (lseek(device_fd, offset, SEEK_SET) < 0) {
-            perror("Error seek in file device");
-            return -1;
+        if (size > BLOCK_SIZE) {
+            fprintf(stderr, "Invalid block size in index: %zu\n", size);
+            continue;
         }
 
-        //Ripristina il blocco originale sul file device
-        ssize_t written_bytes = write(device_fd, buffer, BLOCK_SIZE);
-        if (written_bytes != BLOCK_SIZE) {
-            fprintf(stderr, "Error while writing block %d\n", block_num);
-        } else {
-            printf("Block %d restored\n", block_num);
+        //Recupera il contenuto originale del blocco dal file data
+        if (lseek(data, offset, SEEK_SET) < 0) {
+            perror("Error while seeking in snapshot data");
+            break;
         }
+
+        read_bytes = read(data, buffer, size);
+        if (read_bytes != (ssize_t)size) {
+            fprintf(stderr, "Error while reading block %llu (got %zd bytes)\n", block_num, read_bytes);
+            break;
+        }
+
+        //Scrive il blocco nel device al suo offset originale
+        off_t dev_offset = (off_t)block_num * BLOCK_SIZE;
+        if (lseek(device_fd, dev_offset, SEEK_SET) < 0) {
+            perror("Error while seeking in device");
+            break;
+        }
+
+        ssize_t written_bytes = write(device_fd, buffer, size);
+        if (written_bytes != (ssize_t)size) {
+            fprintf(stderr, "Error while writing block %llu\n", block_num);
+            break;
+        }
+
+        printf("Block %llu restored at offset %lld\n",
+               block_num, (long long)dev_offset);
     }
 
-    closedir(dir);
     close(device_fd);
+    close(data);
+    fclose(index);
     return 0;
 }
 

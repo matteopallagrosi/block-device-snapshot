@@ -21,6 +21,7 @@
 #include <linux/hashtable.h>
 #include <linux/buffer_head.h>
 #include <linux/workqueue.h>
+#include <linux/mutex.h>
 #include "lib/include/scth.h"
 #include "lib/include/auth.h"
 #include "lib/include/loop.h"
@@ -93,10 +94,18 @@ int offset = 0;
 #define store_address(addr) *(unsigned long*)((void*)current->stack + offset) = addr
 #define load_address(addr) addr = (*(unsigned long*)((void*)current->stack + offset))
 
+typedef struct _snapshot_context {
+    struct mutex lock;      //lock per l'accesso in scrittura ai file di snapshot
+    struct file *data;
+    struct file *index;
+} snapshot_context;
+
 typedef struct _snapshot_info {
-    int active;                     //flag per indicare se lo snapshot è attivo
-    char *name_dir;                 //nome della directory in cui salvare lo snapshot
-    bool block_updated[MAX_BLOCKS]; //bitmask che tiene traccia dei blocchi updated almeno una volta
+    int active;                       //flag per indicare se lo snapshot è attivo
+    char *name_dir;                   //nome della directory in cui salvare lo snapshot
+    bool block_updated[MAX_BLOCKS];   //bitmask che tiene traccia dei blocchi updated almeno una volta
+    snapshot_context *ctx;            //contesto per l'accesso in scrittura ai file di snapshot
+
 } snapshot_info;
 
 // Entry per la hash table degli snapshot attivi
@@ -109,13 +118,13 @@ struct snapshot_entry {
 DEFINE_HASHTABLE(snapshot_table, SNAPSHOT_HASH_BITS);
 
 struct packed_work {
-    char *data;               // copia del contenuto del blocco
+    char *data;                     // copia del contenuto del blocco
     size_t size;
     sector_t block_nr;        
     char name_dir[PATH_MAX];
+    snapshot_context *ctx;
     struct work_struct the_work;
 };
-
 
 ///Funzione di cui viene richiesta l'esecuzione alle altre cpu con smp_call_fuction() -> IPI
 void run_on_cpu(void* x) {//this is here just to enable a kprobe on it 
@@ -409,6 +418,14 @@ static int mount_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             info->active = 1; //Segna lo snapshot come attivo
             info->name_dir = name_dir;
 
+            snapshot_context *ctx = kzalloc(sizeof(snapshot_context), GFP_ATOMIC);
+            if (!ctx) {
+                return -ENOMEM;
+            }
+            mutex_init(&ctx->lock);
+
+            info->ctx = ctx;
+
             //Inserisce le info sullo snapshot nella hash table
             entry->dev = dev;
             hash_add(snapshot_table, &entry->node, dev);
@@ -447,6 +464,13 @@ static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
             if (entry->info->name_dir!=NULL) {
                 kfree(entry->info->name_dir); //Libera il nome della directory dello snapshot
             }
+            if (entry->info->ctx->index != NULL) {
+                filp_close(entry->info->ctx->index, NULL); //Chiude il file index
+            }
+            if (entry->info->ctx->data != NULL) {
+                filp_close(entry->info->ctx->data, NULL); //Chiude il file dati
+            }
+            kfree(entry->info->ctx);
             kfree(entry->info); //Libera la struttura snapshot_info
             hash_del(&entry->node);
             kfree(entry);
@@ -499,41 +523,67 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
 void snapshot_worker(struct work_struct *the_work)
 {
     struct packed_work *work = container_of(the_work, struct packed_work, the_work);
-    struct file *file;
-    char *filepath;
+    snapshot_context *ctx = work->ctx;
+    loff_t offset;
     int ret;
+    char index_entry[128];
+    size_t idx_len;
 
-    printk("%s: snapshot_worker: saving block %llu to dir %s\n",
-           MODNAME, (unsigned long long)work->block_nr, work->name_dir);
+    printk("%s: snapshot_worker: saving block %llu in %s\n",MODNAME, (unsigned long long)work->block_nr, work->name_dir);
 
-    //Alloca path: /snapshot/<name_dir>/<block_nr>
-    filepath = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!filepath) {
-        printk("%s: failed to allocate filepath buffer\n", MODNAME);
-        goto out;
+    //Acquisisce il lock per l'accesso in scrittura ai file di snapshot per uno specifico filesystem
+    mutex_lock(&ctx->lock);
+
+    if (ctx->data == NULL && ctx->index == NULL) {
+
+        char *data_path = kmalloc(PATH_MAX, GFP_ATOMIC);
+        char *index_path = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (!data_path || !index_path) {
+            printk("%s: error while allocating paths\n", MODNAME);
+            goto out_unlock;
+        }
+
+        snprintf(index_path, PATH_MAX, "%s/index", work->name_dir);
+        snprintf(data_path, PATH_MAX, "%s/data", work->name_dir);
+
+        ctx->index = filp_open(index_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (IS_ERR(ctx->index)) {
+            printk("%s: failed to open snapshot index file in %s\n", MODNAME, work->name_dir);
+            goto out_unlock;
+        }
+
+        ctx->data = filp_open(data_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (IS_ERR(ctx->data)) {
+            printk("%s: failed to open snapshot data file in %s\n", MODNAME, work->name_dir);
+            filp_close(ctx->index, NULL);
+            goto out_unlock;
+        }
+
+        kfree(data_path);
+        kfree(index_path);
     }
 
-    snprintf(filepath, PATH_MAX, "%s/%llu", work->name_dir,
-             (unsigned long long)work->block_nr);
+    //Recupera la dimensione attuale del file dati
+    offset = vfs_llseek(ctx->data, 0, SEEK_END);
 
-    //Crea il file per mantenere lo snapshot del blocco
-    file = filp_open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (IS_ERR(file)) {
-        printk("%s: open snapshot file failed: %ld\n", MODNAME, PTR_ERR(file));
-        goto out_free;
+    //Scrive il blocco nel file dati
+    ret = kernel_write(ctx->data, work->data, work->size, &ctx->data->f_pos);
+    if (ret < 0) {
+        printk("%s: write snapshot data failed: %d\n", MODNAME, ret);
+        goto out_unlock;
     }
 
-    //Registra lo snapshot
-    ret = kernel_write(file, work->data, work->size, &file->f_pos);
-    if (ret < 0)
-        printk("%s: write snapshot to file failed: %d\n", MODNAME, ret);
+    //Scrive i metadati per gestire lo snapshot del blocco nell’indice
+    idx_len = snprintf(index_entry, sizeof(index_entry), "%llu %llu %zu\n", (unsigned long long)work->block_nr, (unsigned long long)offset, work->size);
 
-    filp_close(file, NULL);
+    ret = kernel_write(ctx->index, index_entry, idx_len, ctx->index->f_pos);
+    if (ret < 0) {
+        printk("%s: write snapshot index failed: %d\n", MODNAME, ret);
+    }
 
-out_free:
-    kfree(filepath);
+out_unlock:
+    mutex_unlock(&ctx->lock);
 
-out:    
     kfree(work->data);
     kfree(work);
 }
@@ -576,8 +626,9 @@ static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         // Copia il contenuto del blocco nel buffer per il deferred work
         work->size = bh->b_size;
         work->data = original_block;
-
         work->block_nr = block_nr;
+
+        work->ctx = info->ctx;
 
         //Copia il nome della directory su cui verrà realizzato lo snapshot in deferred work
         snprintf(work->name_dir, sizeof(work->name_dir), "/snapshot/%s", info->name_dir);
