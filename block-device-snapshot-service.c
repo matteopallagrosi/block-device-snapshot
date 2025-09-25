@@ -44,6 +44,9 @@ unsigned long new_sys_call_array[] = {0x0,0x0};
 #define HACKED_ENTRIES (int)(sizeof(new_sys_call_array)/sizeof(unsigned long))
 int restore[HACKED_ENTRIES] = {[0 ... (HACKED_ENTRIES-1)] -1};
 
+char *password = NULL;
+module_param(password, charp, 0660);
+
 #define setup_target_func "run_on_cpu"
 
 DEFINE_PER_CPU(unsigned long, BRUTE_START);
@@ -846,6 +849,20 @@ int init_module(void) {
 
     int i;
     int ret;
+
+    if (!password) {
+        printk("%s: No password provided at module load\n", MODNAME);
+        return -EINVAL;
+    }
+
+    printk("Questa è la password: %s\n", password);
+
+    //Configura l'hash della password per l'utilizzo delle system calls
+    ret = set_password_hash(password);
+    if (ret < 0) {
+        printk("%s: cannot set password hash\n", MODNAME);
+        return ret;
+    }
 
     if (the_syscall_table == 0x0){
         printk("%s: cannot manage sys_call_table address set to 0x0\n",MODNAME);

@@ -11,7 +11,7 @@ clean:
 
 mount:
 	mkdir /snapshot
-	insmod the_block-device-snapshot-service.ko the_syscall_table=$(A)
+	insmod the_block-device-snapshot-service.ko the_syscall_table=$(A) password=test
 	
 unmount:
 	rm -rf /snapshot

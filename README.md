@@ -39,7 +39,7 @@ This module is required to locate entries in the system call table that are used
 To install the block-device snapshot manager module, run the following commands in the root directory of the project:
 - `make all` to compile
 
-- `sudo make mount` to mount the module and create the `/snapshot` directory in the system root directory.
+- `sudo make mount PASSWORD=<my_password>` to mount the module and create the `/snapshot` directory in the system root directory.
 
 In this way, the activate_snapshot and deactivate_snapshot system calls will be registered.
 
@@ -68,7 +68,7 @@ you can run:
 
 to enable or disable the snapshot service on a specific device (or loop device).
 - `<device_path>`: the device name, or the full path to the file for a loop device.
-- `<password>`: the password required to use the system calls, set when mounting the module.
+- `<password>`: the password required to use the system calls, set when mounting the module. 
 
 The `sudo` command is used to allow execution of system calls that require the calling thread to have (effective) root privileges.
 
