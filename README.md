@@ -39,7 +39,7 @@ This module is required to locate entries in the system call table that are used
 To install the block-device snapshot manager module, run the following commands in the root directory of the project:
 - `make all` to compile
 
-- `sudo make mount PASSWORD=<my_password>` to mount the module and create the `/snapshot` directory in the system root directory.
+- `sudo make mount PASSWORD=<my_password>` to mount the module and create the `/snapshot` directory in the system root directory. If no password is provided, the default password "test" is used.
 
 In this way, the activate_snapshot and deactivate_snapshot system calls will be registered.
 
