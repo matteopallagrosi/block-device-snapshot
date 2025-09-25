@@ -855,8 +855,6 @@ int init_module(void) {
         return -EINVAL;
     }
 
-    printk("Questa è la password: %s\n", password);
-
     //Configura l'hash della password per l'utilizzo delle system calls
     ret = set_password_hash(password);
     if (ret < 0) {
