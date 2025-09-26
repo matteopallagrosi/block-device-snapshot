@@ -58,8 +58,6 @@ unsigned long successful_search_counter = 0;
 //offset of the per-CPU variable that keeps the reference to the current kprobe context
 unsigned long* reference_offset = 0x0;
 
-#define MAX_PASSWD_SIZE 32
-
 #define MAX_DEV_NAME_SIZE 120
 
 #define MAX_BLOCKS 100 //Questo numero coincide con il numero massimo di blocchi previsti per il singlefilefs
@@ -169,7 +167,7 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 
 //Crea un nome per la subdirectory dello snapshot a partire dal path del device e dal timestamp corrente
 //La subdirectory avrà il nome <path>_YYYYMMDD_HHMMSS, con timestamp relativo al Coordinated Universal Time (UTC).
-char *create_name_dir_from_path(char *path, struct timespec64 timestamp) {
+static char *create_name_dir_from_path(char *path, struct timespec64 timestamp) {
 
     struct tm time;
     char *name, *p;
@@ -211,7 +209,7 @@ char *create_name_dir_from_path(char *path, struct timespec64 timestamp) {
 }
 
 //Creazione di una subdirectory dentro a /snapshot, utilizzata per memorizzare gli snapshot di un device
-int create_directory(char *name_dir) {
+static int create_directory(char *name_dir) {
     
     struct path parent_path;
     struct dentry *dentry;

@@ -14,7 +14,7 @@ MODULE_DESCRIPTION("authentication service");
 
 static u8 stored_passwd_hash[HASHED_PASSWD_SIZE];
 
-int compute_hashed_password(const char *passwd, u8 *hash, size_t len) {
+static int compute_hashed_password(const char *passwd, u8 *hash, size_t len) {
     struct crypto_shash *cipher;
     struct shash_desc *desc;
     int ret;
