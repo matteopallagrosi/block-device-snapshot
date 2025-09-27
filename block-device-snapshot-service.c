@@ -94,11 +94,8 @@ int offset = sizeof(struct thread_info);
 int offset = 0;
 #endif
 
-#define store_address(addr) *(unsigned long*)((void*)current->stack + offset) = addr
-#define load_address(addr) addr = (*(unsigned long*)((void*)current->stack + offset))
-
-#define store_flag(flag) *(unsigned long*)((void*)current->stack + offset + sizeof(unsigned long)) = flag
-#define load_flag(flag) flag = (*(unsigned long*)((void*)current->stack + offset + sizeof(unsigned long)))
+#define store(value, off) *(unsigned long*)((void*)current->stack + offset + off) = value
+#define load(value, off) value = (*(unsigned long*)((void*)current->stack + offset + off))
 
 typedef struct _snapshot_context {
     struct mutex lock;      //lock per l'accesso in scrittura ai file di snapshot
@@ -527,7 +524,7 @@ static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
 //Quando viene invocata una vfs_write, setta il write_flag a 1. In questo modo è possibile distinguere quando una sb_bread successiva è stata invocata da una write o da una read
 static int vfs_write_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
 
-    store_flag(1UL);
+    store(1UL, sizeof(unsigned long));
     
     return 0;
 
@@ -536,7 +533,7 @@ static int vfs_write_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
 //Quando viene invocata una vfs_read, setta il write_flag a 0
 static int vfs_read_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
 
-    store_flag(0UL);
+    store(0UL, sizeof(unsigned long));
     
     return 0;
 
@@ -546,7 +543,7 @@ static int vfs_read_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
 static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 
     unsigned long write_flag;
-    load_flag(write_flag);
+    load(write_flag, sizeof(unsigned long));
 
     //Se write_flag != 1 significa che la bread non è stata invocata da una write, perciò non serve bufferizzare il contenuto originale del blocco.
     if (write_flag != 1) {
@@ -579,7 +576,7 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
         // Copia il contenuto del blocco in un buffer
         memcpy(original_block, bh->b_data, bh->b_size);
 
-        store_address(original_block);
+        store(original_block, 0);
     }
 
     return 0;
@@ -686,7 +683,7 @@ static int write_pre_hook(struct kprobe *kp, struct pt_regs *regs){
         }
 
         //Recupera il contenuto originale del blocco
-        load_address(original_block);
+        load(original_block, 0);
 
         // Copia il contenuto del blocco nel buffer per il deferred work
         work->size = bh->b_size;
