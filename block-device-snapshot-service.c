@@ -128,7 +128,7 @@ struct packed_work {
 };
 
 ///Funzione di cui viene richiesta l'esecuzione alle altre cpu con smp_call_fuction() -> IPI
-void run_on_cpu(void* x) {//this is here just to enable a kprobe on it 
+void run_on_cpu(void* x) { 
 	printk("%s: running on CPU %d\n", MODNAME, smp_processor_id());
 	return;
 }
@@ -151,9 +151,9 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
         #else
         if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) &the_retprobe->kp) {
         #endif
-		    atomic_inc((atomic_t*)&successful_search_counter);//mention we have found the target 
+		    atomic_inc((atomic_t*)&successful_search_counter);//Per indicare che il target è stato trovato
 		    printk("%s: found the target per-cpu variable (CPU %d) - offset is %p\n", MODNAME, smp_processor_id(),temp);
-		    reference_offset = temp;//this assignment is done by multiple threads with no problem (perchè la struttura della per-cpu memory è la stessa per tutte le cpu, quindi tutte scrivono lo stesso offset qui)
+		    reference_offset = temp;//questa assegnazione è fatta da molteplici thread senza problemi (perchè la struttura della per-cpu memory è la stessa per tutte le cpu, quindi tutte scrivono lo stesso offset qui)
             break;
         }
 	    if(temp <= 0) return 1;
@@ -229,12 +229,6 @@ static int create_directory(char *name_dir) {
         path_put(&parent_path);
         return -1;
     }
-
-    /*err = vfs_path_lookup(parent_path.dentry, parent_path.mnt, name_dir, LOOKUP_DIRECTORY, &dir_path);
-    if (err < 0) {
-        printk("%s: error in lookup dentry (%d)\n", MODNAME, err);
-        return err;
-    }*/
 
     // Crea la subdirectory se non esiste (crea inode da associare alla dentry).
     if (!dentry->d_inode) {
@@ -536,10 +530,6 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
     dev_t dev = bh->b_bdev->bd_dev;
     sector_t block_nr = bh->b_blocknr;
 
-    //TODO: se il file è aperto in sola lettura (o il filesystem è montato in sola lettura) non deve fare nulla
-
-    //TODO: se questa read non è seguita da una write non deve fare nulla (non serve bufferizzare il contenuto originale)
-
     //Recupera lo snapshot_info per il filesystem montato
     hash_for_each_possible(snapshot_table, entry, node, dev) {
     if (entry->dev == dev)
@@ -710,7 +700,7 @@ asmlinkage long sys_activate_snapshot(char * dev_name, char * passwd){
         return -EINVAL;
     }
 
-    //registra dev_name all'interno della lista dei device con snapshot attivo
+    //Registra dev_name all'interno della lista dei device con snapshot attivo
     node = kmem_cache_alloc(cache, GFP_USER);
     if (node == NULL) return -ENOMEM;
 
