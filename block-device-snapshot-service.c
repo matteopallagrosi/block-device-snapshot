@@ -84,6 +84,8 @@ static struct kprobe kp_mount;
 static struct kprobe kp_kill_sb;
 static struct kprobe kp_write;
 static struct kretprobe bread_probe;
+static struct kprobe kp_vfs_write;
+static struct kprobe kp_vfs_read;
 
 
 #ifdef CONFIG_THREAD_INFO_IN_TASK
@@ -94,6 +96,9 @@ int offset = 0;
 
 #define store_address(addr) *(unsigned long*)((void*)current->stack + offset) = addr
 #define load_address(addr) addr = (*(unsigned long*)((void*)current->stack + offset))
+
+#define store_flag(flag) *(unsigned long*)((void*)current->stack + offset + sizeof(unsigned long)) = flag
+#define load_flag(flag) flag = (*(unsigned long*)((void*)current->stack + offset + sizeof(unsigned long)))
 
 typedef struct _snapshot_context {
     struct mutex lock;      //lock per l'accesso in scrittura ai file di snapshot
@@ -519,8 +524,34 @@ static int kill_sb_pre_hook(struct kprobe *kp, struct pt_regs *regs){
     return 0;
 }
 
+//Quando viene invocata una vfs_write, setta il write_flag a 1. In questo modo è possibile distinguere quando una sb_bread successiva è stata invocata da una write o da una read
+static int vfs_write_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
+
+    store_flag(1UL);
+    
+    return 0;
+
+}
+
+//Quando viene invocata una vfs_read, setta il write_flag a 0
+static int vfs_read_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
+
+    store_flag(0UL);
+    
+    return 0;
+
+}
+
 //Intercetta il buffer_head ritornato dalla __bread_gfp per registrare il contenuto originale
 static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
+
+    unsigned long write_flag;
+    load_flag(write_flag);
+
+    //Se write_flag != 1 significa che la bread non è stata invocata da una write, perciò non serve bufferizzare il contenuto originale del blocco.
+    if (write_flag != 1) {
+        return 0; 
+    }
 
     snapshot_info *info;
     struct snapshot_entry *entry;
@@ -871,7 +902,7 @@ int init_module(void) {
     ret = register_kprobe(&kp_mount);
     if (ret < 0) {
 		printk("%s: hook init failed, returned %d\n", MODNAME, ret);
-        goto err_5;
+        goto err_7;
 	}
 
     setup_probe.kp.symbol_name = setup_target_func;
@@ -881,7 +912,7 @@ int init_module(void) {
     ret = register_kretprobe(&setup_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
-        goto err_4;
+        goto err_6;
 	}
 
     kp_kill_sb.symbol_name = "kill_block_super";
@@ -889,15 +920,15 @@ int init_module(void) {
     ret = register_kprobe(&kp_kill_sb);
     if (ret < 0) {
 		printk("%s: hook init failed for kill_block_super, returned %d\n", MODNAME, ret);
-        goto err_3;
+        goto err_5;
 	}
 
     kp_write.symbol_name = "write_dirty_buffer";
     kp_write.pre_handler = (kprobe_pre_handler_t)write_pre_hook;
     ret = register_kprobe(&kp_write);
     if (ret < 0) {
-		printk("%s: hook init failed for vfs_write, returned %d\n", MODNAME, ret);
-        goto err_2;
+		printk("%s: hook init failed for write_dirty_buffer, returned %d\n", MODNAME, ret);
+        goto err_4;
 	}
 
     bread_probe.kp.symbol_name = "__bread_gfp";
@@ -907,6 +938,22 @@ int init_module(void) {
     ret = register_kretprobe(&bread_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the bread probe, returned %d\n", MODNAME, ret);
+        goto err_3;
+	}
+
+    kp_vfs_write.symbol_name = "vfs_write";
+    kp_vfs_write.pre_handler = (kprobe_pre_handler_t)vfs_write_pre_hook;
+    ret = register_kprobe(&kp_vfs_write);
+    if (ret < 0) {
+		printk("%s: hook init failed for vfs_write, returned %d\n", MODNAME, ret);
+        goto err_2;
+	}
+
+    kp_vfs_read.symbol_name = "vfs_read";
+    kp_vfs_read.pre_handler = (kprobe_pre_handler_t)vfs_read_pre_hook;
+    ret = register_kprobe(&kp_vfs_read);
+    if (ret < 0) {
+		printk("%s: hook init failed for vfs_read, returned %d\n", MODNAME, ret);
         goto err_1;
 	}
 
@@ -953,17 +1000,21 @@ int init_module(void) {
 
     return 0;
 
-err_0:
-    unregister_kretprobe(&bread_probe);   
+err_0:    
+    unregister_kprobe(&kp_vfs_read);
 err_1:
-    unregister_kprobe(&kp_write);
+    unregister_kprobe(&kp_vfs_write);    
 err_2:
-    unregister_kprobe(&kp_kill_sb);
+    unregister_kretprobe(&bread_probe);   
 err_3:
-    unregister_kretprobe(&setup_probe);
+    unregister_kprobe(&kp_write);
 err_4:
-    unregister_kprobe(&kp_mount);
+    unregister_kprobe(&kp_kill_sb);
 err_5:
+    unregister_kretprobe(&setup_probe);
+err_6:
+    unregister_kprobe(&kp_mount);
+err_7:
     kmem_cache_destroy(cache);
 
     return -1;
@@ -994,10 +1045,16 @@ void cleanup_module(void) {
     printk("%s: kill superblock kprobe unregistered\n",MODNAME);
 
     unregister_kprobe(&kp_write);
-    printk("%s: write kprobe unregistered\n",MODNAME);
+    printk("%s: write_dirty_buffer kprobe unregistered\n",MODNAME);
 
     unregister_kretprobe(&bread_probe);
     printk("%s: bread kprobe unregistered\n",MODNAME);
+
+    unregister_kprobe(&kp_vfs_write); 
+    printk("%s: vfs_write kprobe unregistered\n",MODNAME);
+
+    unregister_kprobe(&kp_vfs_read);
+    printk("%s: vfs_read kprobe unregistered\n",MODNAME);
 
     //Rimuove eventuali nodi ancora presenti nella lista dei device (per mancata invocazione della deactivate_snapshot) prima di distruggere la memcache
     device *p;
