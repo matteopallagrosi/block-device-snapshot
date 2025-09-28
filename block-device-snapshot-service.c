@@ -145,8 +145,6 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 	while (temp > 0) {
         //brute force search of the current_kprobe per-CPU variable
 		//for enabling blocking execution of the kretprobe
-		//you can save this time setting up a per CPU-variable via 
-		//smp_call_function() upon module startup
         temp -= 1; 
         #ifndef CONFIG_KRETPROBE_ON_RETHOOK
         if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) &ri->rp->kp) {

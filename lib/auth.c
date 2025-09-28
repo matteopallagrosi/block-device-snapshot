@@ -19,7 +19,7 @@ static int compute_hashed_password(const char *passwd, u8 *hash, size_t len) {
     struct shash_desc *desc;
     int ret;
 
-    //Alloca il cyper da utilizzare per calcolare l'hash della password    
+    //Alloca il cipher da utilizzare per calcolare l'hash della password    
     cipher = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(cipher)) {
         printk("Error during cipher creation: %ld", PTR_ERR(cipher));
