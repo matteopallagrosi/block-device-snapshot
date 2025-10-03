@@ -83,7 +83,7 @@ static struct kretprobe *the_retprobe = &setup_probe;
 static struct kprobe kp_mount;
 static struct kprobe kp_kill_sb;
 static struct kprobe kp_write;
-static struct kretprobe bread_probe;
+static struct kprobe bread_probe;
 static struct kprobe kp_vfs_write;
 static struct kprobe kp_vfs_read;
 
@@ -537,8 +537,15 @@ static int vfs_read_pre_hook(struct kprobe *kp, struct pt_regs *regs) {
 
 }
 
+
+static void read_complete(struct bio *bio)
+{
+    struct completion *event = (struct completion *)bio->bi_private;
+    complete(event);
+}
+
 //Intercetta il buffer_head ritornato dalla __bread_gfp per registrare il contenuto originale
-static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
+static int bread_pre_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 
     unsigned long write_flag;
     load(write_flag, sizeof(unsigned long));
@@ -552,9 +559,12 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
     struct snapshot_entry *entry;
     char *original_block;
 
-    struct buffer_head *bh = (struct buffer_head *)regs_return_value(the_regs);
-    dev_t dev = bh->b_bdev->bd_dev;
-    sector_t block_nr = bh->b_blocknr;
+    //Recupera i primi tre argomenti della __bread_gfp
+    struct block_device * bdev = (struct block_device *)the_regs->di;  
+    sector_t block_nr = (sector_t)the_regs->si;               
+    unsigned int block_size = (unsigned int)the_regs->dx;
+
+    dev_t dev = bdev->bd_dev;           
 
     //Recupera lo snapshot_info per il filesystem montato
     hash_for_each_possible(snapshot_table, entry, node, dev) {
@@ -564,17 +574,58 @@ static int bread_return_hook(struct kretprobe_instance *ri, struct pt_regs *the_
 
     //Se è attivo il servizio di snapshot e il blocco non è stato precedentemente updated, registra il contenuto originale qualora venisse successivamente modificato
     if (info != NULL && info->active && !info->block_updated[block_nr]) {
-       
-        original_block = kzalloc(bh->b_size, GFP_ATOMIC);
-        if (!original_block) {
-            printk("%s: cannot allocate original block data\n", MODNAME);
+
+        struct page *page = alloc_page(GFP_ATOMIC);
+        if (!page) {
+            printk("%s: cannot allocate memory for the original block\n", MODNAME);
             return -ENOMEM;
         }
 
-        // Copia il contenuto del blocco in un buffer
-        memcpy(original_block, bh->b_data, bh->b_size);
+        original_block = (char *)page_address(page);
 
-        store(original_block, 0);
+        // Prepara una bio per leggere il blocco
+        struct bio * bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_ATOMIC);
+        if (!bio) {
+            __free_page(page);
+            return -ENOMEM;
+        }
+
+        struct completion event;
+        init_completion(&event);
+
+        bio->bi_iter.bi_sector = block_nr * (block_size >> 9); // settore = blocco * (size/512). In Linux i settori sono sempre considerati di 512 byte.
+        bio->bi_end_io = read_complete;
+        bio->bi_private = &event;
+
+        int ret = bio_add_page(bio, page, block_size, 0);
+        if (ret != block_size) {
+            printk("%s: bio_add_page failed\n", MODNAME);
+            bio_put(bio);
+            __free_page(page);
+            return -EIO;
+        }
+
+        //Inoltra la bio in modo sincrono
+        submit_bio(bio);
+
+        while (!try_wait_for_completion(&event)) {
+            cpu_relax(); 
+        }
+
+        bio_put(bio);
+
+        char *buffer = kzalloc(block_size, GFP_ATOMIC);
+        if (!buffer) {
+            printk("%s: cannot allocate memory for the original block buffer\n", MODNAME);
+            __free_page(page);
+            return -ENOMEM;
+        }
+
+        memcpy(buffer, original_block, block_size);
+
+        store(buffer, 0);
+
+        __free_page(page);
     }
 
     return 0;
@@ -926,11 +977,9 @@ int init_module(void) {
         goto err_4;
 	}
 
-    bread_probe.kp.symbol_name = "__bread_gfp";
-	bread_probe.handler = (kretprobe_handler_t)bread_return_hook;
-	bread_probe.entry_handler = NULL;
-	bread_probe.maxactive = -1;
-    ret = register_kretprobe(&bread_probe);
+    bread_probe.symbol_name = "__bread_gfp";
+	bread_probe.pre_handler = (kprobe_pre_handler_t)bread_pre_hook;
+    ret = register_kprobe(&bread_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the bread probe, returned %d\n", MODNAME, ret);
         goto err_3;
@@ -1000,7 +1049,7 @@ err_0:
 err_1:
     unregister_kprobe(&kp_vfs_write);    
 err_2:
-    unregister_kretprobe(&bread_probe);   
+    unregister_kprobe(&bread_probe);   
 err_3:
     unregister_kprobe(&kp_write);
 err_4:
@@ -1042,7 +1091,7 @@ void cleanup_module(void) {
     unregister_kprobe(&kp_write);
     printk("%s: write_dirty_buffer kprobe unregistered\n",MODNAME);
 
-    unregister_kretprobe(&bread_probe);
+    unregister_kprobe(&bread_probe);
     printk("%s: bread kprobe unregistered\n",MODNAME);
 
     unregister_kprobe(&kp_vfs_write); 

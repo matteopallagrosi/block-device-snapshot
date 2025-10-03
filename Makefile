@@ -4,7 +4,7 @@ PASSWORD ?= test
 
 A = $(shell cat /sys/module/the_usctm/parameters/sys_call_table_address)
 
-all:
+all: clean
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules 
 
 clean:
