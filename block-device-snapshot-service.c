@@ -78,8 +78,7 @@ spinlock_t queue_lock;
 
 struct kmem_cache *cache;
 
-static struct kretprobe setup_probe; //probe per gestione variabili per-cpu
-static struct kretprobe *the_retprobe = &setup_probe; 
+static struct kprobe setup_probe; //probe per gestione variabili per-cpu 
 static struct kprobe kp_mount;
 static struct kprobe kp_kill_sb;
 static struct kprobe kp_write;
@@ -135,8 +134,8 @@ void run_on_cpu(void* x) {
 	return;
 }
 
-//Quando installo il modulo, nella init lancia con smp_call_function su ogni cpu la run_on_cpu, che al momento della return provoca l'esecuzione dell'hook the_search
-static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) { 
+//Quando installo il modulo, nella init lancia con smp_call_function su ogni cpu la run_on_cpu, che provoca l'esecuzione dell'hook the_search
+static int the_search(struct kprobe *kp, struct pt_regs *the_regs) {  
 
 	unsigned long* temp = (unsigned long)&BRUTE_START;
 
@@ -144,13 +143,9 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 
 	while (temp > 0) {
         //brute force search of the current_kprobe per-CPU variable
-		//for enabling blocking execution of the kretprobe
-        temp -= 1; 
-        #ifndef CONFIG_KRETPROBE_ON_RETHOOK
-        if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) &ri->rp->kp) {
-        #else
-        if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) &the_retprobe->kp) {
-        #endif
+		//for enabling blocking execution of the kprobe
+        temp -= 1;  
+        if ((unsigned long) __this_cpu_read(*temp) == (unsigned long) kp) {
 		    atomic_inc((atomic_t*)&successful_search_counter);//Per indicare che il target è stato trovato
 		    printk("%s: found the target per-cpu variable (CPU %d) - offset is %p\n", MODNAME, smp_processor_id(),temp);
 		    reference_offset = temp;//questa assegnazione è fatta da molteplici thread senza problemi (perchè la struttura della per-cpu memory è la stessa per tutte le cpu, quindi tutte scrivono lo stesso offset qui)
@@ -159,7 +154,7 @@ static int the_search(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
 	    if(temp <= 0) return 1;
     }
 
-	//Su ogni cpu viene scritta una nuova variabile per cpu che mantiene per quella cpu il riferimento al contesto di krpobing (ossia l'indirizzo della variabile per-cpu current_kprobe)
+	//Su ogni cpu viene scritta una nuova variabile per cpu che mantiene per quella cpu il riferimento al contesto di kprobing (ossia l'indirizzo della variabile per-cpu current_kprobe)
 	__this_cpu_write(kprobe_context_pointer, temp);
 
 	return 0;
@@ -544,8 +539,8 @@ static void read_complete(struct bio *bio)
     complete(event);
 }
 
-//Intercetta il buffer_head ritornato dalla __bread_gfp per registrare il contenuto originale
-static int bread_pre_hook(struct kretprobe_instance *ri, struct pt_regs *the_regs) {
+//Intercetta la __bread_gfp per registrare il contenuto originale
+static int bread_pre_hook(struct kprobe *kp, struct pt_regs *the_regs) {
 
     unsigned long write_flag;
     load(write_flag, sizeof(unsigned long));
@@ -583,7 +578,7 @@ static int bread_pre_hook(struct kretprobe_instance *ri, struct pt_regs *the_reg
 
         original_block = (char *)page_address(page);
 
-        // Prepara una bio per leggere il blocco
+        //Prepara una bio per leggere il blocco
         struct bio * bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_ATOMIC);
         if (!bio) {
             __free_page(page);
@@ -593,7 +588,7 @@ static int bread_pre_hook(struct kretprobe_instance *ri, struct pt_regs *the_reg
         struct completion event;
         init_completion(&event);
 
-        bio->bi_iter.bi_sector = block_nr * (block_size >> 9); // settore = blocco * (size/512). In Linux i settori sono sempre considerati di 512 byte.
+        bio->bi_iter.bi_sector = block_nr * (block_size >> 9); //settore = blocco * (size/512). In Linux i settori sono sempre considerati di 512 byte.
         bio->bi_end_io = read_complete;
         bio->bi_private = &event;
 
@@ -605,9 +600,10 @@ static int bread_pre_hook(struct kretprobe_instance *ri, struct pt_regs *the_reg
             return -EIO;
         }
 
-        //Inoltra la bio in modo sincrono
+        //Inoltra la bio in modo asincrono
         submit_bio(bio);
 
+        //Attende il completamento della bio
         while (!try_wait_for_completion(&event)) {
             cpu_relax(); 
         }
@@ -951,11 +947,9 @@ int init_module(void) {
         goto err_7;
 	}
 
-    setup_probe.kp.symbol_name = setup_target_func;
-	setup_probe.handler = NULL;
-	setup_probe.entry_handler = (kretprobe_handler_t)the_search;
-	setup_probe.maxactive = -1;
-    ret = register_kretprobe(&setup_probe);
+    setup_probe.symbol_name = setup_target_func;
+	setup_probe.pre_handler = (kprobe_pre_handler_t)the_search;
+    ret = register_kprobe(&setup_probe);
 	if (ret < 0) {
 		printk("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
         goto err_6;
@@ -1055,7 +1049,7 @@ err_3:
 err_4:
     unregister_kprobe(&kp_kill_sb);
 err_5:
-    unregister_kretprobe(&setup_probe);
+    unregister_kprobe(&setup_probe);
 err_6:
     unregister_kprobe(&kp_mount);
 err_7:
@@ -1082,7 +1076,7 @@ void cleanup_module(void) {
     unregister_kprobe(&kp_mount);
     printk("%s: mount kprobe unregistered\n",MODNAME);
 
-    unregister_kretprobe(&setup_probe);
+    unregister_kprobe(&setup_probe);
     printk("%s: setup kprobe unregistered\n",MODNAME);
 
     unregister_kprobe(&kp_kill_sb);

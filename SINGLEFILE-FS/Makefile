@@ -10,7 +10,6 @@ load-FS-driver:
 
 clean:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-	rm onefilemakefs
 
 create-fs:
 	dd bs=4096 count=100 if=/dev/zero of=image
